@@ -1,14 +1,39 @@
-"""Пресеты сенсоров. Данные пока здесь, позже переедут в YAML.
+"""Пресеты камер и сенсоров. Данные пока здесь, позже переедут в YAML.
 """
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import replace
 from typing import Any
 
+from photosim.camera import Camera
 from photosim.sensor import SensorModel
 
-__all__ = ["REVIEW_16MM", "RPI_CM3", "review_16mm", "rpi_cm3"]
+__all__ = [
+    "CAMERAS",
+    "REVIEW_16MM",
+    "RPI_CM3",
+    "SENSORS",
+    "camera",
+    "review_16mm",
+    "rpi_cm3",
+    "sensor",
+]
+
+#: Внутренние параметры камер (без дисторсии): фокус, мм; пиксель, мкм; кадр.
+CAMERAS: dict[str, dict[str, Any]] = {
+    # объектив 16 мм на IMX264
+    "review_16mm": {"focal_mm": 16.0, "pixel_um": 3.45, "width": 2448, "height": 2048},
+    # Camera Module 3, стандартный объектив 4,74 мм (у Wide — 2,75 мм);
+    # IMX708, 4608×2592, пиксель 1,4 мкм — паспорт Raspberry Pi
+    "rpi_cm3": {"focal_mm": 4.74, "pixel_um": 1.4, "width": 4608, "height": 2592},
+}
+
+
+def camera(name: str) -> Camera:
+    """Камера из ``CAMERAS`` по имени."""
+    return Camera.from_physical(**_lookup(CAMERAS, name, "камеры"))
 
 #: Камера обзора: Sony IMX264
 #: Источник: отчёт EMVA 1288 камеры FLIR Blackfly S BFS-U3-50S5M
@@ -61,6 +86,29 @@ def rpi_cm3(
         top = 2 ** params["bits"] - 1 - params["black_level_dn"]
         params["gain_e_per_dn"] = full_well_e / top
     return _with_fill(params, tau_ref, fill)
+
+
+#: Пресеты сенсоров по имени: ``fn(tau_ref, fill, **overrides) -> SensorModel``.
+SENSORS: dict[str, Callable[..., SensorModel]] = {
+    "review_16mm": review_16mm,
+    "rpi_cm3": rpi_cm3,
+}
+
+
+def sensor(
+    name: str, tau_ref: float, fill: float = 0.7, **overrides: Any
+) -> SensorModel:
+    """Сенсор из ``SENSORS`` по имени."""
+    return _lookup(SENSORS, name, "сенсора")(tau_ref, fill, **overrides)
+
+
+def _lookup(table: dict[str, Any], name: str, what: str) -> Any:
+    try:
+        return table[name]
+    except KeyError:
+        raise KeyError(
+            f"нет пресета {what} {name!r}, доступны: {', '.join(sorted(table))}"
+        ) from None
 
 
 def _with_fill(params: dict[str, Any], tau_ref: float, fill: float) -> SensorModel:

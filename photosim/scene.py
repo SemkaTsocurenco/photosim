@@ -26,6 +26,7 @@ __all__ = [
     "Accel",
     "Arc",
     "AxisRotation",
+    "FacingCamera",
     "FixedOrientation",
     "Linear",
     "Motion",
@@ -380,6 +381,71 @@ class AxisRotation(_NormalFromOrientation):
 
     def angular_velocity(self, t: ArrayLike) -> NDArray:
         return _const(readonly(self.omega * self.axis), t)
+
+
+@dataclass(frozen=True, eq=False)
+class FacingCamera(_NormalFromOrientation):
+    """Марка всё время смотрит на центр камеры: ``n(t) = normalize(C - X(t))``.
+
+    ``translation`` — закон движения центра марки, ``camera_center`` — ``C``
+    в мире. Оси в плоскости — как в ``frame_from_normal``, но с постоянным
+    ``ref``: если он не задан, выбирается один раз по нормали при ``t = 0``,
+    чтобы оси не меняли скачком во времени. Угловая скорость аналитическая:
+    ``omega = (x × x' + y × y' + n × n') / 2``.
+
+    Вне оптической оси образ такой марки — не круг с центром в проекции
+    центра: эксцентриситет остаётся, как у сферы.
+    """
+
+    translation: TranslationLaw
+    camera_center: NDArray
+    ref: NDArray | None = None
+
+    def __post_init__(self) -> None:
+        c = as_vec3(self.camera_center, "camera_center")
+        object.__setattr__(self, "camera_center", c)
+        if self.ref is None:
+            d0 = c - self.translation.position(0.0)
+            ref = _REF_Z if abs(d0[2]) < 0.9 * np.linalg.norm(d0) else _REF_Y
+        else:
+            ref = unit_vec3(self.ref, "ref")
+        object.__setattr__(self, "ref", ref)
+        self._frame(np.zeros(1))  # вырожденная геометрия при t = 0 — сразу ошибка
+
+    def _frame(self, ts: NDArray) -> tuple[NDArray, ...]:
+        """Расстояние до камеры ``(Nt, 1)``, оси ``n, x, y`` и ``|ref × n|``."""
+        d = self.camera_center - self.translation.position(ts)
+        r = np.linalg.norm(d, axis=-1, keepdims=True)
+        if np.any(r == 0.0):
+            raise ValueError(
+                "центр марки совпал с центром камеры: нормаль не определена"
+            )
+        n = d / r
+        xt = np.cross(self.ref, n)
+        rho = np.linalg.norm(xt, axis=-1, keepdims=True)
+        if np.any(rho < 1e-9):
+            raise ValueError(
+                f"нормаль стала параллельна ref {self.ref}: оси в плоскости марки "
+                "не определены, задайте другой ref"
+            )
+        x = xt / rho
+        return r, n, x, np.cross(n, x), rho
+
+    def orientation(self, t: ArrayLike) -> NDArray:
+        ts, scalar = as_time(t)
+        _, n, x, y, _ = self._frame(ts)
+        return squeeze_time(np.stack([x, y, n], axis=-1), scalar)
+
+    def angular_velocity(self, t: ArrayLike) -> NDArray:
+        ts, scalar = as_time(t)
+        r, n, x, y, rho = self._frame(ts)
+        dd = -self.translation.velocity(ts)  # d = C - X(t)
+        dn = (dd - n * np.sum(n * dd, axis=-1, keepdims=True)) / r
+        dxt = np.cross(self.ref, dn)
+        dx = (dxt - x * np.sum(x * dxt, axis=-1, keepdims=True)) / rho
+        dy = np.cross(dn, x) + np.cross(n, dx)
+        w = 0.5 * (np.cross(x, dx) + np.cross(y, dy) + np.cross(n, dn))
+        return squeeze_time(w, scalar)
 
 
 # Motion

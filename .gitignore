@@ -1,3 +1,7 @@
 .venv/
 __pycache__
 output
+output/*
+runs
+.ruff_cache
+.pytest_cache

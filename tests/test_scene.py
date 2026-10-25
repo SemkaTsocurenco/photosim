@@ -9,6 +9,7 @@ from photosim.scene import (
     Accel,
     Arc,
     AxisRotation,
+    FacingCamera,
     FixedOrientation,
     Linear,
     Motion,
@@ -239,11 +240,17 @@ def test_laws_frozen_and_readonly():
 
 R_TILT = frame_from_normal([1.0, -0.5, 0.3])
 
+CAM_C = np.array([0.1, 0.05, 0.0])  # центр камеры для FacingCamera
+
 ORIENTATIONS = {
     "fixed": FixedOrientation(R_TILT),
     "rot_z": AxisRotation(R_TILT, AXIS, OMEGA),
     "rot_tilted_neg": AxisRotation(R_TILT, _unit([0.3, -1.0, 0.5]), -0.8),
     "rot_about_normal": AxisRotation(np.eye(3), [0, 0, 1], 1.1),
+    # |n_z| > 0.9: ref — мировая ось y
+    "facing_arc": FacingCamera(Arc(CENTER, AXIS, START, OMEGA), CAM_C),
+    # сбоку от камеры: ref — мировая ось z
+    "facing_tilted_arc": FacingCamera(tilted_arc(), [1.5, 0.5, 0.0]),
 }
 
 
@@ -343,6 +350,29 @@ def test_angular_velocity_finite_difference(law):
         W = (law.orientation(t + h) @ Rt.T - law.orientation(t - h) @ Rt.T) / (2 * h)
         np.testing.assert_allclose(W, -W.T, atol=1e-8)
         np.testing.assert_allclose(law.angular_velocity(t), skew_to_vec(W), atol=1e-8)
+
+
+@pytest.mark.parametrize("name", ["facing_arc", "facing_tilted_arc"])
+def test_facing_camera_normal_points_to_camera(name):
+    law = ORIENTATIONS[name]
+    t = np.linspace(-5, 5, 41)
+    to_cam = law.camera_center - law.translation.position(t)
+    to_cam /= np.linalg.norm(to_cam, axis=1, keepdims=True)
+    np.testing.assert_allclose(law.normal(t), to_cam, atol=1e-15)
+    # ref постоянный: ось x всегда перпендикулярна ему
+    np.testing.assert_allclose(law.orientation(t)[:, :, 0] @ law.ref, 0.0, atol=1e-15)
+
+
+def test_facing_camera_static_and_ref():
+    law = FacingCamera(Static([0.3, 0.0, 2.0]), [0.0, 0.0, 0.0])
+    np.testing.assert_array_equal(law.angular_velocity(np.zeros(3)), 0.0)
+    np.testing.assert_array_equal(law.ref, [0.0, 1.0, 0.0])  # |n_z| > 0.9
+    explicit = FacingCamera(Static([0.3, 0.0, 2.0]), [0.0, 0.0, 0.0], ref=[1, 0, 0])
+    np.testing.assert_allclose(explicit.orientation(0.0)[:, 0] @ [1, 0, 0], 0.0)
+    with pytest.raises(ValueError, match="совпал"):
+        FacingCamera(Static([0.0, 0.0, 0.0]), [0.0, 0.0, 0.0])
+    with pytest.raises(ValueError, match="ref"):
+        FacingCamera(Static([0.0, 0.0, 2.0]), [0.0, 0.0, 0.0], ref=[0, 0, 1])
 
 
 # ===================================================================== Motion

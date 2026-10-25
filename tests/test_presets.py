@@ -1,9 +1,35 @@
 import numpy as np
 import pytest
 
-from photosim.presets import REVIEW_16MM, review_16mm, rpi_cm3
+from photosim.presets import REVIEW_16MM, camera, review_16mm, rpi_cm3, sensor
 
 TAU = 1e-3
+
+
+@pytest.mark.parametrize(
+    "name, f_px, size",
+    [
+        ("review_16mm", 16 / 3.45e-3, (2448, 2048)),
+        ("rpi_cm3", 4.74 / 1.4e-3, (4608, 2592)),
+    ],
+)
+def test_camera_presets(name, f_px, size):
+    cam = camera(name)
+    assert cam.fx == pytest.approx(f_px) and cam.fy == cam.fx
+    assert (cam.width, cam.height) == size
+    assert not cam.has_distortion
+
+
+def test_sensor_by_name():
+    s = sensor("review_16mm", TAU, 0.6, psf=False)
+    assert s.mean_electrons(np.ones((3, 3)), TAU) == pytest.approx(0.6 * s.full_well_e)
+    assert not s.psf
+    r = sensor("rpi_cm3", TAU, full_well_e=4000.0, read_noise_e=2.0)
+    assert r.bits == 10
+    with pytest.raises(KeyError, match="review_16mm"):
+        sensor("nikon", TAU)
+    with pytest.raises(KeyError, match="rpi_cm3"):
+        camera("nikon")
 
 
 def test_review_16mm_fill():
