@@ -6,9 +6,12 @@ from __future__ import annotations
 import itertools
 import json
 import math
+import multiprocessing
+import os
 import platform
 import subprocess
 from collections.abc import Mapping, Sequence
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import asdict, dataclass, field, fields, is_dataclass, replace
 from datetime import datetime
 from pathlib import Path
@@ -43,6 +46,7 @@ __all__ = [
     "EFFECTS",
     "REFERENCES",
     "RUNS_DIR",
+    "TILT_REFERENCES",
     "T_K",
     "Config",
     "Effects",
@@ -63,6 +67,9 @@ T_K = 0.0
 
 #: Эталоны центра, см. ``references``.
 REFERENCES = ("proj_start", "proj_mid", "conic_mid", "exposure_conic")
+
+#: От чего отсчитывается наклон марки, см. ``Config``.
+TILT_REFERENCES = ("optical_axis", "line_of_sight")
 
 #: Папка запусков по умолчанию.
 RUNS_DIR = Path("runs")
@@ -151,10 +158,14 @@ class Config:
         Радиус марки, м.
     position
         Центр марки в момент ``t_ref``, м, в мире.
-    tilt_deg, tilt_axis
-        Наклон нормали от направления на камеру, градусы, вокруг оси ``"x"``
-        или ``"y"`` камеры (её часть, перпендикулярная лучу зрения).
-        Положительный наклон вокруг ``"y"`` поворачивает нормаль к -x камеры.
+    tilt_deg, tilt_axis, tilt_reference
+        Наклон нормали, градусы, вокруг оси ``"x"`` или ``"y"`` камеры (её
+        части, перпендикулярной направлению отсчёта). Отсчёт
+        ``tilt_reference``: ``"optical_axis"`` (по умолчанию) — от минус оси
+        камеры, то есть наклон к плоскости изображения, как в формуле
+        эксцентриситета; ``"line_of_sight"`` — от направления на камеру.
+        На оптической оси оба совпадают. Положительный наклон вокруг ``"y"``
+        поворачивает нормаль к -x камеры.
     motion
         Закон движения центра: ``{"type": "static"}``,
         ``{"type": "linear", "velocity": V}``,
@@ -191,6 +202,7 @@ class Config:
     position: tuple[float, float, float] = (0.0, 0.0, 1.0)
     tilt_deg: float = 0.0
     tilt_axis: str = "y"
+    tilt_reference: str = "optical_axis"
     motion: dict[str, Any] = field(default_factory=lambda: {"type": "static"})
     rotation: dict[str, Any] | None = None
     sensor: str = "review_16mm"
@@ -225,6 +237,7 @@ class Config:
         _choice(self.camera, presets.CAMERAS, "camera")
         _choice(self.sensor, presets.SENSORS, "sensor")
         _choice(self.tilt_axis, _CAMERA_AXIS, "tilt_axis")
+        _choice(self.tilt_reference, TILT_REFERENCES, "tilt_reference")
         _choice(self.motion.get("type"), _MOTION_KEYS, "motion['type']")
         _choice(self.t_ref, ("start", "mid"), "t_ref")
         _choice(self.shutter, ("global", "rolling"), "shutter")
@@ -293,13 +306,23 @@ def _translation(motion: Mapping[str, Any], X_ref: NDArray, t_ref: float):
     return Arc(center, axis, start, omega)
 
 
-def _tilted_normal(pose: Pose, X: NDArray, tilt_deg: float, tilt_axis: str) -> NDArray:
-    """Нормаль, наклонённая на ``tilt_deg`` от направления на камеру."""
-    d = _unit(pose.center - X, "направление на камеру")
+def _tilted_normal(
+    pose: Pose, X: NDArray, tilt_deg: float, tilt_axis: str, reference: str
+) -> NDArray:
+    """Нормаль, наклонённая на ``tilt_deg`` от направления отсчёта ``d``.
+
+    ``d`` — минус ось камеры в мире (``"optical_axis"``) или направление на
+    камеру (``"line_of_sight"``); ось наклона — ось камеры ``tilt_axis`` без
+    составляющей вдоль ``d``.
+    """
+    if reference == "optical_axis":
+        d = -pose.R[2]
+    else:
+        d = _unit(pose.center - X, "направление на камеру")
     a = pose.R[_CAMERA_AXIS[tilt_axis]]  # ось камеры в мире
     a = a - (a @ d) * d
     if np.linalg.norm(a) < 1e-9:
-        raise ValueError(f"луч зрения параллелен оси наклона {tilt_axis!r}")
+        raise ValueError(f"направление отсчёта параллельно оси наклона {tilt_axis!r}")
     a /= np.linalg.norm(a)
     t = math.radians(tilt_deg)
     return d * math.cos(t) + np.cross(a, d) * math.sin(t)
@@ -318,7 +341,10 @@ def build(config: Config) -> Setup:
     X_ref = np.array(cfg.position, dtype=np.float64)
 
     translation = _translation(cfg.motion, X_ref, t_ref)
-    R_ref = frame_from_normal(_tilted_normal(pose, X_ref, cfg.tilt_deg, cfg.tilt_axis))
+    normal = _tilted_normal(
+        pose, X_ref, cfg.tilt_deg, cfg.tilt_axis, cfg.tilt_reference
+    )
+    R_ref = frame_from_normal(normal)
     if cfg.rotation is None:
         orientation = FixedOrientation(R_ref)
     else:
@@ -510,22 +536,53 @@ def _set_path(obj: Any, path: str, value: Any) -> Any:
     raise ValueError(f"путь {path!r}: {type(obj).__name__} не датакласс и не словарь")
 
 
+def _n_workers(n_jobs: int) -> int:
+    if isinstance(n_jobs, bool) or not isinstance(n_jobs, int):
+        raise TypeError(f"n_jobs должно быть целым, получено {n_jobs!r}")
+    if n_jobs == -1:
+        return os.cpu_count() or 1
+    if n_jobs < 1:
+        raise ValueError(f"n_jobs должно быть >= 1 или -1, получено {n_jobs}")
+    return n_jobs
+
+
 def _run_all(
-    configs: Sequence[Config], seed: int, labels: Sequence[Mapping[str, Any]]
+    configs: Sequence[Config],
+    seed: int,
+    labels: Sequence[Mapping[str, Any]],
+    n_jobs: int = 1,
 ) -> pd.DataFrame:
-    """Точки с независимыми потомками ``SeedSequence(seed)``; колонка ``point``."""
+    """Точки с независимыми потомками ``SeedSequence(seed)``; колонка ``point``.
+
+    Seed каждой точки свой, поэтому результат не зависит от ``n_jobs``.
+    """
     seeds = np.random.SeedSequence(seed).spawn(len(configs))
+    workers = min(_n_workers(n_jobs), len(configs))
+    if workers <= 1:
+        results = [run_point(cfg, ss) for cfg, ss in zip(configs, seeds, strict=True)]
+    else:
+        ctx = multiprocessing.get_context("spawn")
+        with ProcessPoolExecutor(max_workers=workers, mp_context=ctx) as pool:
+            results = list(pool.map(run_point, configs, seeds))
     rows = []
-    for i, (cfg, ss, label) in enumerate(zip(configs, seeds, labels, strict=True)):
-        rows += [{"point": i, **label, **row} for row in run_point(cfg, ss)]
+    for i, (point_rows, label) in enumerate(zip(results, labels, strict=True)):
+        rows += [{"point": i, **label, **row} for row in point_rows]
     return pd.DataFrame(rows)
 
 
-def sweep(base: Config, grid: Mapping[str, Sequence[Any]]) -> pd.DataFrame:
+def sweep(
+    base: Config, grid: Mapping[str, Sequence[Any]], *, n_jobs: int = 1
+) -> pd.DataFrame:
     """Декартово произведение значений ``grid`` вокруг ``base``.
 
     Ключи — поля ``Config``; вложенные через точку (``"effects.psf"``,
     ``"motion.velocity"``). Строк: произведение длин списков на число методов.
+
+    ``n_jobs`` — число процессов (``-1`` — все ядра); результат от него не
+    зависит. Процессы запускаются методом ``spawn``: скрипт, который
+    вызывает перебор, должен быть под ``if __name__ == "__main__":``, а
+    методы оценки — зарегистрированы при импорте модуля, а не во время
+    выполнения.
     """
     keys = list(grid)
     configs = []
@@ -534,11 +591,15 @@ def sweep(base: Config, grid: Mapping[str, Sequence[Any]]) -> pd.DataFrame:
         for key, value in zip(keys, combo, strict=True):
             cfg = _set_path(cfg, key, value)
         configs.append(cfg)
-    return _run_all(configs, base.seed, [{}] * len(configs))
+    return _run_all(configs, base.seed, [{}] * len(configs), n_jobs)
 
 
-def ablation(base: Config, effects: Sequence[str] | None = None) -> pd.DataFrame:
+def ablation(
+    base: Config, effects: Sequence[str] | None = None, *, n_jobs: int = 1
+) -> pd.DataFrame:
     """Режимы включения эффектов: колонки ``mode`` и ``effect``.
+
+    ``n_jobs`` — как в ``sweep``.
     """
     names = list(EFFECTS if effects is None else effects)
     for name in names:
@@ -552,7 +613,7 @@ def ablation(base: Config, effects: Sequence[str] | None = None) -> pd.DataFrame
     plan += [("single", n, with_on({n})) for n in names]
     plan += [("leave_one_out", n, with_on(set(names) - {n})) for n in names]
     labels = [{"mode": mode, "effect": eff} for mode, eff, _ in plan]
-    return _run_all([cfg for _, _, cfg in plan], base.seed, labels)
+    return _run_all([cfg for _, _, cfg in plan], base.seed, labels, n_jobs)
 
 
 #: Метрики ``additivity`` по умолчанию: смещения и дисперсии складываются.

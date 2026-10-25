@@ -16,6 +16,7 @@ import pytest
 from photosim.camera import Pose
 from photosim.experiment import (
     EFFECTS,
+    TILT_REFERENCES,
     Config,
     Effects,
     _from_json,
@@ -59,6 +60,22 @@ def test_reproducible_bitwise():
     # другой seed — другой результат
     c = sweep(replace(base, seed=7), grid)
     assert not np.array_equal(a["bias_u_px"], c["bias_u_px"])
+
+
+def test_parallel_matches_serial():
+    base = replace(FAST, n_mc=5, methods=("centroid", "gauss2d"))
+    grid = {"tau": [1e-3, 2e-3], "tilt_deg": [0.0, 40.0]}
+    serial = sweep(base, grid, n_jobs=1)
+    parallel = sweep(base, grid, n_jobs=2)
+    pd.testing.assert_frame_equal(parallel, serial, check_exact=True)
+
+
+@pytest.mark.parametrize(
+    "n_jobs, exc", [(0, ValueError), (-2, ValueError), (1.5, TypeError)]
+)
+def test_bad_n_jobs(n_jobs, exc):
+    with pytest.raises(exc):
+        sweep(FAST, {"tau": [1e-3]}, n_jobs=n_jobs)
 
 
 # ============================================================= 2. ничего не включено
@@ -255,31 +272,55 @@ def test_save_load_roundtrip(tmp_path):
     ids=["static", "linear", "accel", "arc"],
 )
 @pytest.mark.parametrize("t_ref", ["start", "mid"])
-def test_build_state_at_t_ref(motion, t_ref):
+@pytest.mark.parametrize("tilt_reference", TILT_REFERENCES)
+def test_build_state_at_t_ref(motion, t_ref, tilt_reference):
     cfg = replace(
         FAST,
         position=OFF_AXIS,
         motion=motion,
         rotation={"axis": (1, 1, 0), "omega": 2.0},
         tilt_deg=30.0,
+        tilt_reference=tilt_reference,
         t_ref=t_ref,
         tau=0.01,
     )
     s = build(cfg)
     np.testing.assert_allclose(s.motion.position(s.t_ref), OFF_AXIS, atol=1e-15)
-    to_cam = -np.array(OFF_AXIS) / np.linalg.norm(OFF_AXIS)
-    angle = math.degrees(math.acos(s.motion.normal(s.t_ref) @ to_cam))
-    assert angle == pytest.approx(30.0, abs=1e-9)
+    directions = {
+        "optical_axis": -s.pose.R[2],
+        "line_of_sight": -np.array(OFF_AXIS) / np.linalg.norm(OFF_AXIS),
+    }
+
+    def angle_to(name):
+        cos = s.motion.normal(s.t_ref) @ directions[name]
+        return math.degrees(math.acos(cos))
+
+    assert angle_to(tilt_reference) == pytest.approx(30.0, abs=1e-9)
+    (other,) = set(TILT_REFERENCES) - {tilt_reference}
+    assert abs(angle_to(other) - 30.0) > 1.0  # вне оси варианты различаются
     if "velocity" in motion:
         np.testing.assert_allclose(s.motion.velocity(s.t_ref), motion["velocity"])
 
 
-def test_build_tilt_direction_matches_render_tests():
-    # tilted_normal из test_render: [-sin a, 0, -cos a] на оси
-    s = build(replace(FAST, tilt_deg=45.0))
+@pytest.mark.parametrize("tilt_reference", TILT_REFERENCES)
+def test_build_tilt_direction_matches_render_tests(tilt_reference):
+    # tilted_normal из test_render: [-sin a, 0, -cos a]; на оси оба отсчёта равны
+    s = build(replace(FAST, tilt_deg=45.0, tilt_reference=tilt_reference))
     a = math.radians(45.0)
     np.testing.assert_allclose(
         s.motion.normal(0.0), [-math.sin(a), 0.0, -math.cos(a)], atol=1e-15
+    )
+
+
+def test_tilt_reference_with_rotated_camera():
+    pose = Pose.from_euler([10.0, -20.0, 5.0], [0.1, 0.0, 0.2])
+    cfg = replace(FAST, camera_pose=pose, position=OFF_AXIS)
+    s = build(cfg)  # без наклона марка || сенсору повёрнутой камеры
+    np.testing.assert_allclose(s.motion.normal(0.0), -pose.R[2], atol=1e-15)
+    los = build(replace(cfg, tilt_reference="line_of_sight"))
+    to_cam = pose.center - np.array(OFF_AXIS)
+    np.testing.assert_allclose(
+        los.motion.normal(0.0), to_cam / np.linalg.norm(to_cam), atol=1e-15
     )
 
 
