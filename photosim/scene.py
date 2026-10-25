@@ -25,11 +25,11 @@ from photosim._checks import (
 __all__ = [
     "Accel",
     "Arc",
+    "AxisRotation",
     "FixedOrientation",
     "Linear",
     "Motion",
     "OrientationLaw",
-    "Rotation",
     "Static",
     "TranslationLaw",
     "exposure_mean_position",
@@ -308,6 +308,15 @@ _REF_Y = readonly(np.array([0.0, 1.0, 0.0]))
 
 
 def frame_from_normal(normal: ArrayLike, ref: ArrayLike | None = None) -> NDArray:
+    """Ориентация марки по нормали: ``R0 = [x | y | n]``, тройка правая.
+
+    ``x = normalize(cross(ref, n))``, ``y = cross(n, x)``. По умолчанию
+    ``ref`` — мировая ось z, а при ``|n_z| >= 0.9`` — мировая ось y (иначе
+    ``ref`` почти параллелен ``n``). Из-за этого переключения при плавном
+    изменении нормали оси x и y в плоскости марки на ``|n_z| = 0.9`` меняются
+    скачком. Для круглой марки это не важно, для кодовой важно: тогда
+    задавайте ``ref`` явно. ``ref``, параллельный ``n``, даёт ``ValueError``.
+    """
     n = unit_vec3(normal, "normal")
     if ref is None:
         r = _REF_Z if abs(n[2]) < 0.9 else _REF_Y
@@ -348,7 +357,7 @@ class FixedOrientation(_NormalFromOrientation):
 
 
 @dataclass(frozen=True, eq=False)
-class Rotation(_NormalFromOrientation):
+class AxisRotation(_NormalFromOrientation):
     """Вращение марки вокруг **мировой** оси ``axis`` с угловой скоростью ``omega``.
 
     Вращение меняет только ориентацию; центр марки задаёт закон движения.
@@ -384,7 +393,7 @@ class Motion:
     translation_law: TranslationLaw
     orientation_law: OrientationLaw
 
-    # -- центр 
+    # -- центр
     def position(self, t: ArrayLike) -> NDArray:
         return self.translation_law.position(t)
 
@@ -394,7 +403,7 @@ class Motion:
     def acceleration(self, t: ArrayLike) -> NDArray:
         return self.translation_law.acceleration(t)
 
-    # -- ориентация 
+    # -- ориентация
     def orientation(self, t: ArrayLike) -> NDArray:
         return self.orientation_law.orientation(t)
 
@@ -404,7 +413,7 @@ class Motion:
     def angular_velocity(self, t: ArrayLike) -> NDArray:
         return self.orientation_law.angular_velocity(t)
 
-    # -- преобразования точек 
+    # -- преобразования точек
     def _pose(
         self, points: ArrayLike, t: ArrayLike, name: str
     ) -> tuple[NDArray, NDArray, NDArray, bool]:
@@ -462,7 +471,7 @@ class Motion:
         """
         arc = Arc(center, axis, start, omega)
         R0 = frame_from_normal(normal0)
-        return cls(arc, Rotation(R0, arc.axis, arc.omega))
+        return cls(arc, AxisRotation(R0, arc.axis, arc.omega))
 
     @classmethod
     def carriage_arc(

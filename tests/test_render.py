@@ -18,7 +18,7 @@ from photosim.oracle import (
     exposure_conic_center,
     mean_projected_center,
 )
-from photosim.render import compute_roi, intersect_plane, psf_margin_px, render
+from photosim.render import compute_roi, intersect_plane, render
 from photosim.scene import FixedOrientation, Linear, Motion
 from photosim.target import Target
 
@@ -250,18 +250,25 @@ def test_roi_is_clipped_to_frame():
     assert res.clipped
 
 
-# Центр марки в 10 пикс. от края кадра (край — на −0,5 и W − 0,5).
-EDGE_10PX = {
-    "right": (CAM.width - 10.5 - CAM.cx, 0.0),
-    "left": (9.5 - CAM.cx, 0.0),
-    "top": (0.0, 9.5 - CAM.cy),
-    "bottom": (0.0, CAM.height - 10.5 - CAM.cy),
-}
+SIDES = ["right", "left", "top", "bottom"]
 
 
-@pytest.mark.parametrize("side", EDGE_10PX)
+def edge_offset(side, dist):
+    """(du, dv), при котором центр марки в ``dist`` пикс. от края кадра.
+
+    Край кадра — на -0,5 и W - 0,5 (H - 0,5).
+    """
+    return {
+        "right": (CAM.width - 0.5 - dist - CAM.cx, 0.0),
+        "left": (dist - 0.5 - CAM.cx, 0.0),
+        "top": (0.0, dist - 0.5 - CAM.cy),
+        "bottom": (0.0, CAM.height - 0.5 - dist - CAM.cy),
+    }[side]
+
+
+@pytest.mark.parametrize("side", SIDES)
 def test_clipped_near_edge(side):
-    du, dv = EDGE_10PX[side]
+    du, dv = edge_offset(side, 10)
     m = Motion.static(world_for_pixel(du, dv), FACING)
     res = render(CAM, POSE, TARGET, m, T_K, TAU, ss=8, nt=1)
     assert res.clipped
@@ -287,13 +294,27 @@ def test_clipped_by_margin_only():
     assert clipped2
 
 
-def test_psf_margin_px():
-    assert psf_margin_px(0.7) == 4
-    assert psf_margin_px(0.0) == 1
-    assert psf_margin_px(0.75) == 4  # 4σ = 3 ровно
-    assert psf_margin_px(1.5) == 7
-    with pytest.raises(ValueError):
-        psf_margin_px(-0.1)
+# margin_px = 4 — запас под PSF sigma = 0,7; марка r ≈ 23 пикс. вместе с
+# запасом занимает ≈ 27 пикс. от центра.
+@pytest.mark.parametrize(
+    "dist, expected",
+    [(10, True), (30, False), (None, False)],
+    ids=["10px_from_edge", "30px_from_edge", "center"],
+)
+def test_clipped_flag(dist, expected):
+    du, dv = (0.0, 0.0) if dist is None else edge_offset("right", dist)
+    m = Motion.static(world_for_pixel(du, dv), FACING)
+    res = render(CAM, POSE, TARGET, m, T_K, TAU, ss=2, nt=1, margin_px=4)
+    assert res.clipped == expected
+
+
+@pytest.mark.parametrize("side", SIDES)
+def test_clipped_by_psf_margin(side):
+    # центр в 25 пикс. от края: марка целиком в кадре, а запас 4 пикс. — нет
+    m = Motion.static(world_for_pixel(*edge_offset(side, 25)), FACING)
+    _, clipped0 = compute_roi(CAM, POSE, TARGET, m, T_K, TAU, margin_px=0)
+    assert not clipped0
+    assert render(CAM, POSE, TARGET, m, T_K, TAU, ss=2, nt=1, margin_px=4).clipped
 
 
 # ============================================================= 9–10. построчный затвор

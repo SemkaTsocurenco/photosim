@@ -4,12 +4,6 @@
 в относительных единицах марки.
 Флагов эффектов здесь нет: рендер всегда считает честную физику, а
 эффекты «выключаются» выбором ``Motion`` и ``nt``
-
-    d_w = d_c @ pose.R                 # в мир (= pose.Rᵀ d_c), C = pose.center
-    o_l = R_obj(t)ᵀ (C − X(t))         # центр камеры в системе марки
-    d_l = d_w @ R_obj(t)               # луч в системе марки
-    s   = −o_l,z / d_l,z,  xy = o_l,xy + s d_l,xy   (пересечение с z = 0)
-
 """
 
 from __future__ import annotations
@@ -30,7 +24,6 @@ __all__ = [
     "RenderResult",
     "compute_roi",
     "intersect_plane",
-    "psf_margin_px",
     "render",
 ]
 
@@ -105,21 +98,6 @@ def _positive_int(value: int, name: str) -> int:
     if value < 1:
         raise ValueError(f"{name} должно быть не меньше 1, получено {value}")
     return int(value)
-
-
-def psf_margin_px(sigma_psf: float) -> int:
-    """Запас ROI для гауссовой PSF: ``ceil(4 σ) + 1`` пикс.
-
-    За ``4 σ`` уходит хвост гауссианы ``≈ 3·10⁻⁵`` от света у края марки,
-    ещё один пиксель — запас сверху. ``sigma_psf`` в пикселях; при ``0``
-    (без PSF) запас 1 пикс.
-    """
-    sigma = finite_scalar(sigma_psf, "sigma_psf")
-    if sigma < 0:
-        raise ValueError(
-            f"sigma_psf не может быть отрицательным, получено {sigma_psf!r}"
-        )
-    return math.ceil(4 * sigma) + 1
 
 
 def compute_roi(
@@ -233,8 +211,8 @@ def render(
         строки ``v`` (абсолютный номер в кадре) начинается в
         ``t_k + v · t_row``. При глобальном ``t_row`` должен быть 0.
     margin_px
-        Запас вокруг марки при вычислении ROI, пикс. Если изображение потом
-        размывается PSF, запас должен быть не меньше ``psf_margin_px(σ)``,
+        Запас вокруг марки при вычислении ROI, пикс. Если потом применяется
+        PSF, запас должен быть не меньше ``SensorModel.required_margin_px``,
         иначе часть света уйдёт за ROI и центр тяжести сместится.
     """
     ss = _positive_int(ss, "ss")

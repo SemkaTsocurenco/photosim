@@ -8,10 +8,10 @@ from photosim._checks import check_rotation, is_rotation_matrix
 from photosim.scene import (
     Accel,
     Arc,
+    AxisRotation,
     FixedOrientation,
     Linear,
     Motion,
-    Rotation,
     Static,
     exposure_mean_position,
     exposure_samples,
@@ -241,9 +241,9 @@ R_TILT = frame_from_normal([1.0, -0.5, 0.3])
 
 ORIENTATIONS = {
     "fixed": FixedOrientation(R_TILT),
-    "rot_z": Rotation(R_TILT, AXIS, OMEGA),
-    "rot_tilted_neg": Rotation(R_TILT, _unit([0.3, -1.0, 0.5]), -0.8),
-    "rot_about_normal": Rotation(np.eye(3), [0, 0, 1], 1.1),
+    "rot_z": AxisRotation(R_TILT, AXIS, OMEGA),
+    "rot_tilted_neg": AxisRotation(R_TILT, _unit([0.3, -1.0, 0.5]), -0.8),
+    "rot_about_normal": AxisRotation(np.eye(3), [0, 0, 1], 1.1),
 }
 
 
@@ -299,7 +299,7 @@ def test_from_normal_up_is_identity_and_ref():
         frame_from_normal([1, 0, 0], ref=[2, 0, 0])
 
 
-# 10. Rotation: начало, полный оборот, единичная нормаль
+# 10. AxisRotation: начало, полный оборот, единичная нормаль
 @pytest.mark.parametrize("name", ["rot_z", "rot_tilted_neg", "rot_about_normal"])
 def test_rotation_start_and_full_turn(name):
     law = ORIENTATIONS[name]
@@ -325,7 +325,7 @@ def test_rotation_about_own_normal():
 def test_rotation_axis_is_world_axis():
     # Ось вращения задана в мире: нормаль вдоль x крутится вокруг мировой z.
     R0 = frame_from_normal([1, 0, 0])
-    law = Rotation(R0, [0, 0, 1], 1.0)
+    law = AxisRotation(R0, [0, 0, 1], 1.0)
     np.testing.assert_allclose(law.normal(math.pi / 2), [0, 1, 0], atol=1e-15)
     # Ось, понятая в системе марки (Rot справа), дала бы другой результат.
     from scipy.spatial.transform import Rotation as SR
