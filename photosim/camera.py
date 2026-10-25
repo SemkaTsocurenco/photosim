@@ -1,17 +1,10 @@
-
 from collections import OrderedDict
 from dataclasses import dataclass, field
 
 import numpy as np
 from scipy.spatial.transform import Rotation
 
-
-def _as_points(a, dim):
-    """Привести (..., dim) к (M, dim), запомнив ведущие измерения."""
-    a = np.asarray(a, dtype=float)
-    if a.ndim == 0 or a.shape[-1] != dim:
-        raise ValueError(f"ожидалась форма (..., {dim}), а пришла {a.shape}")
-    return a.reshape(-1, dim), a.shape[:-1]
+from photosim._checks import as_flat_points, check_rotation
 
 
 @dataclass(frozen=True, eq=False)
@@ -161,7 +154,7 @@ class Camera:
         nan получают точки с Z <= 0 и точки дальше r_max (там дисторсия
         не взаимно однозначна).
         """
-        X, lead = _as_points(X_cam, 3)
+        X, lead = as_flat_points(X_cam, 3, "X_cam")
         Z = X[:, 2]
         valid = Z > 0
 
@@ -182,7 +175,7 @@ class Camera:
 
         nan получают пиксели, для которых обратная дисторсия не нашлась.
         """
-        p, lead = _as_points(uv, 2)
+        p, lead = as_flat_points(uv, 2, "uv")
         xy = (p - [self.cx, self.cy]) / [self.fx, self.fy]
         xy, valid = self._undistort(xy)
 
@@ -196,7 +189,7 @@ class Camera:
     def jacobian(self, X_cam):
         """Производная d(u, v)/d(X, Y, Z): (..., 3) -> (..., 2, 3).
         """
-        X, lead = _as_points(X_cam, 3)
+        X, lead = as_flat_points(X_cam, 3, "X_cam")
         x, y, z = X.T
         with np.errstate(divide="ignore", invalid="ignore"):
             iz = 1 / z
@@ -282,20 +275,10 @@ class Pose:
     """Поза камеры: X_cam = R @ X_world + T."""
 
     def __init__(self, R, T, atol=1e-6):
-        R = np.asarray(R, dtype=float)
         T = np.asarray(T, dtype=float)
-        if R.shape != (3, 3):
-            raise ValueError(f"R должна быть (3, 3), а пришла {R.shape}")
         if T.size != 3:
             raise ValueError(f"T должен содержать 3 числа, а пришло {T.shape}")
-
-        err = np.abs(R.T @ R - np.eye(3)).max()
-        if not err <= atol:
-            raise ValueError(f"R не ортогональна (ошибка {err:.2g}), это не поворот")
-        det = np.linalg.det(R)
-        if not abs(det - 1) <= atol:
-            raise ValueError(f"det R = {det:.3f}: это отражение, а не поворот "
-                             "(переставлены оси или перепутан знак)")
+        R = check_rotation(R, "R", atol=atol)   # копия, только для чтения
 
         self.R = R
         self.T = T.reshape(3)
