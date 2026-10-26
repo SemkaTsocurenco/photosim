@@ -24,6 +24,7 @@ __all__ = [
     "centroid_signal_for_sigma",
     "eccentricity_first_order",
     "eccentricity_formula3",
+    "eccentricity_point_shift",
     "eccentricity_pole",
     "eccentricity_tilt_sensitivity",
     "fit_variance_quadratic",
@@ -118,6 +119,50 @@ def eccentricity_tilt_sensitivity(
         * np.cos(2 * np.asarray(theta))
         / np.asarray(z) ** 2
     )
+
+
+def eccentricity_point_shift(
+    radius: float,
+    points: ArrayLike,
+    normals: ArrayLike,
+    centers: ArrayLike,
+    visible: ArrayLike,
+) -> NDArray:
+    """Оценка смещения триангулированной точки от неисправленного эксцентриситета.
+
+        delta_X ≈ -n r**2 <cos(v) / D>,
+
+    среднее по камерам, которые видят запись. Точки ``(..., 3)`` и нормали
+    (нормируются здесь) — в мире, ``centers`` — центры камер ``(C, 3)``
+    (``Pose.center``), ``visible`` — ``(..., C)``; ``v`` — угол между нормалью
+    и направлением на камеру, ``D`` — расстояние до камеры. Результат — м,
+    ``(..., 3)``; где запись не видит ни одна камера, — nan.
+
+    Вывод. Луч через центр эллипса-образа проходит через образ полюса
+    ``X_e`` (``eccentricity_pole``), а он лежит в плоскости марки: камера
+    видит центр сдвинутым в этой плоскости к себе на ``r**2 sin(theta) / Z``
+    (``theta`` — угол между осью камеры и нормалью). У двух камер под ±v к
+    нормали, смотрящих на марку, сдвиги в плоскости гасятся, а лучи
+    пересекаются за плоскостью, на глубине ``r**2 cos(v) / D``. Смещение
+    идёт по нормали внутрь марки, от ``f`` и числа камер не зависит.
+
+    Для такой пары оценка верна до ``(r / D)**2`` относительно. В общем
+    случае это оценка: точное значение в первом порядке даёт
+    ``network.evaluate`` с ``eccentricity="uncorrected"``. В базовой сцене
+    ``plan.md`` (6 камер по кругу, неподвижные марки) ``|delta_X|`` там в
+    медиане 0,89 от оценки (0,67…1,06 между 5-м и 95-м процентилями),
+    медианный косинус угла между ними — 0,988.
+    """
+    X = np.asarray(points, dtype=np.float64)
+    n = np.broadcast_to(np.asarray(normals, dtype=np.float64), X.shape)
+    n = n / np.linalg.norm(n, axis=-1, keepdims=True)
+    to_cam = np.asarray(centers, dtype=np.float64) - X[..., None, :]  # (..., C, 3)
+    dist = np.linalg.norm(to_cam, axis=-1)
+    cos_v = np.einsum("...ci,...i->...c", to_cam, n) / dist
+    vis = np.asarray(visible, dtype=bool)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        mean = np.where(vis, cos_v / dist, 0.0).sum(axis=-1) / vis.sum(axis=-1)
+    return -(radius**2) * mean[..., None] * n
 
 
 #: Доля дисперсии фона, остающаяся у центра тяжести после ``max(I - bg, 0)``

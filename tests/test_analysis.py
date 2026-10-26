@@ -14,6 +14,7 @@ from photosim.analysis import (
     centroid_signal_for_sigma,
     eccentricity_first_order,
     eccentricity_formula3,
+    eccentricity_point_shift,
     eccentricity_pole,
     eccentricity_tilt_sensitivity,
     fit_variance_quadratic,
@@ -26,6 +27,8 @@ from photosim.analysis import (
     std_along_across,
 )
 from photosim.camera import Pose
+from photosim.network import CameraNetwork, TargetSet, evaluate
+from photosim.obs_model import ObsModel
 from photosim.oracle import conic_center, exposure_conic_center
 from photosim.presets import camera
 from photosim.scene import AxisRotation, Motion, Static, frame_from_normal
@@ -104,6 +107,50 @@ def test_tilt_sensitivity_on_axis():
     assert eccentricity_tilt_sensitivity(CAM.fx, 0.005, math.pi / 4, 1.0) == (
         pytest.approx(0.0, abs=1e-15)
     )
+
+
+@pytest.mark.parametrize("v_deg", [15.0, 40.0, 60.0])
+@pytest.mark.parametrize("d, r", [(0.8, 0.01), (1.5, 0.005), (4.0, 0.005)])
+@pytest.mark.parametrize("mode", ["model", "constant"])
+def test_point_shift_symmetric_pair(v_deg, d, r, mode):
+    """Две камеры под ±v к нормали смотрят на марку: оценка верна до (r/D)**2."""
+    rng = np.random.default_rng(int(v_deg * 10 + d * 100))
+    X0 = np.array([0.1, -0.05, 2.0])
+    n = rng.normal(size=3)
+    n /= np.linalg.norm(n)
+    t = np.cross(n, rng.normal(size=3))
+    t /= np.linalg.norm(t)
+    v = math.radians(v_deg)
+    centers = np.array(
+        [X0 + d * (math.cos(v) * n + s * math.sin(v) * t) for s in (1, -1)]
+    )
+    poses = [Pose.look_at(c, X0, up=np.cross(n, t)) for c in centers]
+    model = ObsModel(radius=r, eccentricity="uncorrected", mode=mode)
+    res = evaluate(CameraNetwork([CAM, CAM], poses), TargetSet([X0], n), model)
+    assert res.measured[0] and res.visible.all()
+    est = eccentricity_point_shift(r, X0, n, centers, res.visible[0])
+    np.testing.assert_allclose(est, -(r**2) * math.cos(v) / d * n, rtol=1e-12)
+    # замер: 0,75 (r / D)**2 при v = 60°, меньше при меньших v
+    rel = np.linalg.norm(res.delta[0] - est) / np.linalg.norm(est)
+    assert rel <= (r / d) ** 2
+
+
+def test_point_shift_shapes_and_no_camera():
+    centers = np.array([[0.5, 0.0, 0.0], [-0.5, 0.0, 0.0], [0.0, 0.5, 0.0]])
+    X = np.array([[0.0, 0.0, 1.5], [0.1, 0.0, 1.4]])
+    vis = np.array([[True, True, False], [False, False, False]])
+    out = eccentricity_point_shift(0.005, X, [0.0, 0.0, -2.0], centers, vis)
+    assert out.shape == (2, 3)
+    # по нормали внутрь марки (нормаль -z смотрит на камеры, смещение — +z)
+    assert out[0, 2] > 0 and np.allclose(out[0, :2], 0.0)
+    D = math.hypot(0.5, 1.5)
+    assert out[0, 2] == pytest.approx(0.005**2 * (1.5 / D) / D, rel=1e-12)
+    assert np.isnan(out[1]).all()  # запись не видит ни одна камера
+    batch = eccentricity_point_shift(
+        0.005, X.reshape(1, 2, 3), [0, 0, -1.0], centers, vis[None]
+    )
+    assert batch.shape == (1, 2, 3)
+    np.testing.assert_allclose(batch[0, 0], out[0], rtol=1e-15)
 
 
 def test_formula3_vectorized():

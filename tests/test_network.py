@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 from scipy.spatial.transform import Rotation as SR
 
+from photosim.analysis import eccentricity_point_shift
 from photosim.camera import Camera, Pose
 from photosim.network import (
     _SYM,
@@ -125,6 +126,28 @@ def test_info_matches_explicit_sum():
             assert np.all(r.bias_um[m] > 0)
         else:
             np.testing.assert_array_equal(r.delta[m], 0.0)
+
+
+def test_point_shift_estimate_in_ring_scene():
+    """analysis.eccentricity_point_shift против evaluate в базовой сцене plan.md."""
+    net, ts = ring(6), volume(2000, seed=8, moving=False)
+    r = evaluate(net, ts, ObsModel(eccentricity="uncorrected"))
+    m = r.measured
+    centers = np.array([p.center for p in net.poses])
+    est = eccentricity_point_shift(
+        0.005, ts.points[m], ts.normals[m], centers, r.visible[m]
+    )
+    exact = r.delta[m]
+    ratio = np.linalg.norm(exact, axis=1) / np.linalg.norm(est, axis=1)
+    cos = (
+        np.sum(exact * est, axis=1)
+        / np.linalg.norm(exact, axis=1)
+        / np.linalg.norm(est, axis=1)
+    )
+    # замер (docstring и plan.md): медиана 0,89, 5–95 % — 0,67…1,06; cos 0,988
+    assert 0.85 < np.median(ratio) < 0.93
+    assert np.percentile(ratio, 5) > 0.6 and np.percentile(ratio, 95) < 1.1
+    assert np.median(cos) > 0.98
 
 
 def test_adding_camera_never_worse():
