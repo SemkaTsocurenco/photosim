@@ -59,6 +59,16 @@ def test_effect_labels():
     assert all(label.isascii() for label in style.EFFECT_LABEL.values())
 
 
+def test_ordered():
+    assert style.ordered(["ellipse", "zeta", "centroid", "alpha"]) == [
+        "centroid",
+        "ellipse",
+        "alpha",
+        "zeta",
+    ]
+    assert style.ordered(ESTIMATORS) == list(style.METHOD_STYLE)
+
+
 def test_method_style_is_copy_and_has_fallback():
     s = style.method_style("centroid")
     s["color"] = "red"
@@ -78,3 +88,19 @@ def test_save(styled, tmp_path):
     assert png.read_bytes().startswith(b"\x89PNG")
     # ровно заданная ширина при 600 dpi: рисунок не обрезается
     assert imread(png).shape[:2] == (2.0 * 600, style.COLUMN * 600)
+
+
+def test_output_table_header(tmp_path):
+    import pandas as pd
+
+    from photosim.figures.cli import Output
+
+    run = type("R", (), {"configs": {"quick": False}})()
+    out = Output(run, tmp_path)
+    df = pd.DataFrame({"a": [1.5, 2.5], "b": ["x", "y"]})
+    path = out.table(df, "t", header="model: s^2 = s0^2 + k^2 L^2\nsecond line")
+    lines = path.read_text().splitlines()
+    assert lines[:3] == ["# model: s^2 = s0^2 + k^2 L^2", "# second line", "a,b"]
+    pd.testing.assert_frame_equal(pd.read_csv(path, comment="#"), df)
+    # без заголовка — обычный CSV
+    assert out.table(df, "u").read_text().splitlines()[0] == "a,b"

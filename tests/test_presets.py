@@ -1,7 +1,15 @@
 import numpy as np
 import pytest
 
-from photosim.presets import REVIEW_16MM, camera, review_16mm, rpi_cm3, sensor
+from photosim.presets import (
+    REVIEW_16MM,
+    RPI_CM3_ASSUMED,
+    camera,
+    review_16mm,
+    row_time_estimate,
+    rpi_cm3,
+    sensor,
+)
 
 TAU = 1e-3
 
@@ -11,6 +19,7 @@ TAU = 1e-3
     [
         ("review_16mm", 16 / 3.45e-3, (2448, 2048)),
         ("rpi_cm3", 4.74 / 1.4e-3, (4608, 2592)),
+        ("rpi_cm3_2x2", 4.74 / 2.8e-3, (2304, 1296)),
     ],
 )
 def test_camera_presets(name, f_px, size):
@@ -76,3 +85,14 @@ def test_rpi_cm3_full_well_at_adc_top():
     # без сигнала шум считывания опускает значения и ниже уровня чёрного
     dark = s.expose(np.zeros((20, 20)), TAU, np.random.default_rng(0))
     assert dark.min() < 64.0
+
+
+def test_rpi_cm3_binned_mode():
+    assert camera("rpi_cm3_2x2").fx == pytest.approx(1692.86, abs=0.01)
+    # 1 / (56 кадр/с * 1296 строк)
+    assert row_time_estimate("rpi_cm3_2x2") == pytest.approx(13.78e-6, rel=1e-3)
+    with pytest.raises(KeyError, match="rpi_cm3_2x2"):
+        row_time_estimate("review_16mm")
+    s = sensor("rpi_cm3", TAU, **RPI_CM3_ASSUMED)
+    assert s.full_well_e == RPI_CM3_ASSUMED["full_well_e"]
+    assert s.read_noise_e == RPI_CM3_ASSUMED["read_noise_e"]

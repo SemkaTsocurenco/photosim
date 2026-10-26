@@ -205,11 +205,16 @@ def _gauss_parts(p: NDArray, x: NDArray, y: NDArray) -> tuple:
     return g, xr, yr, c, s
 
 
-def _gauss_residual(p: NDArray, x: NDArray, y: NDArray, z: NDArray) -> NDArray:
-    return p[0] * _gauss_parts(p, x, y)[0] + p[1] - z
+def _gauss_residual(
+    p: NDArray, x: NDArray, y: NDArray, z: NDArray, sw: NDArray | float = 1.0
+) -> NDArray:
+    """Невязка, умноженная на корень из веса пикселя ``sw``."""
+    return sw * (p[0] * _gauss_parts(p, x, y)[0] + p[1] - z)
 
 
-def _gauss_jac(p: NDArray, x: NDArray, y: NDArray, z: NDArray) -> NDArray:
+def _gauss_jac(
+    p: NDArray, x: NDArray, y: NDArray, z: NDArray, sw: NDArray | float = 1.0
+) -> NDArray:
     A, _, _, _, sx, sy, _ = p
     g, xr, yr, c, s = _gauss_parts(p, x, y)
     ag = A * g
@@ -222,7 +227,7 @@ def _gauss_jac(p: NDArray, x: NDArray, y: NDArray, z: NDArray) -> NDArray:
     J[:, 4] = ag * xr**2 / sx**3
     J[:, 5] = ag * yr**2 / sy**3
     J[:, 6] = ag * xr * yr * (1 / sy**2 - 1 / sx**2)
-    return J
+    return J * np.reshape(sw, (-1, 1))
 
 
 def _gauss_initial(z: NDArray, x: NDArray, y: NDArray, b0: float) -> NDArray | None:
@@ -241,25 +246,56 @@ def _gauss_initial(z: NDArray, x: NDArray, y: NDArray, b0: float) -> NDArray | N
     return np.array([z.max() - b0, b0, u, v, sx, sy, th])
 
 
+def _window(center: float, n: int) -> NDArray:
+    """Веса пикселей ``0..n-1`` в окне, симметричном вокруг ``center``.
+
+    Полуширина — до ближайшего края ROI (края пикселей на -0,5 и n - 0,5);
+    пиксель на границе окна входит долей, попавшей в окно. Окно сдвигается
+    с центром непрерывно: без скачков, когда фаза переходит через целое.
+    """
+    half = min(center + 0.5, n - 0.5 - center)
+    left = np.arange(n) - 0.5
+    inside = np.minimum(left + 1, center + half) - np.maximum(left, center - half)
+    return np.clip(inside, 0.0, 1.0)
+
+
 @register("gauss2d")
 def gauss2d(
     images: NDArray, origin: NDArray
 ) -> tuple[NDArray, NDArray, dict[str, NDArray]]:
-    """Подгонка двумерной гауссианы `
+    """Подгонка ``A * exp(-q/2) + B`` (7 параметров), цикл по кадрам.
+
+    Подгонка идёт в окне, симметричном вокруг начального приближения (центр
+    тяжести): иначе несимметричный ROI тянет оценку к своему центру, на
+    0,02 пикс. при сдвиге ROI на пиксель. Модель не уточняется: смещение
+    от несовпадения гауссианы с диском — изучаемый эффект. ``ok = False``,
+    если подгонка не сошлась или центр вышел за ROI; в ``info`` — параметры,
+    невязка, ``status`` и ``nfev`` из ``least_squares``.
     """
     n, h, w = images.shape
     y, x = (a.ravel().astype(np.float64) for a in np.mgrid[0:h, 0:w])
     border = _border_mask(h, w)
     params = np.full((n, 7), np.nan)
     residual = np.full(n, np.nan)
+    status = np.full(n, np.nan)
+    nfev = np.full(n, np.nan)
     ok = np.zeros(n, dtype=bool)
     for k, img in enumerate(images):
         z = img.ravel()
         p0 = _gauss_initial(z, x, y, float(np.median(img[border])))
         if p0 is None:
             continue
+        weight = np.outer(_window(p0[3], h), _window(p0[2], w)).ravel()
+        sel = weight > 0
+        if sel.sum() < 7:
+            continue
+        sw = np.sqrt(weight[sel])
         res = least_squares(
-            _gauss_residual, p0, jac=_gauss_jac, args=(x, y, z), x_scale="jac"
+            _gauss_residual,
+            p0,
+            jac=_gauss_jac,
+            args=(x[sel], y[sel], z[sel], sw),
+            x_scale="jac",
         )
         A, B, u, v, sx, sy, th = res.x
         sx, sy = abs(sx), abs(sy)
@@ -267,7 +303,8 @@ def gauss2d(
             sx, sy, th = sy, sx, th + math.pi / 2
         th = (th + math.pi / 2) % math.pi - math.pi / 2
         params[k] = A, B, u, v, sx, sy, th
-        residual[k] = math.sqrt(2 * res.cost / z.size)
+        residual[k] = math.sqrt(2 * res.cost / weight[sel].sum())
+        status[k], nfev[k] = res.status, res.nfev
         ok[k] = (
             res.success
             and A > 0
@@ -282,6 +319,8 @@ def gauss2d(
         "sigma_y": params[:, 5],
         "theta": params[:, 6],
         "residual": residual,
+        "status": status,
+        "nfev": nfev,
     }
     return params[:, 2:4] + origin, ok, info
 

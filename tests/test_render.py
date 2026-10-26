@@ -370,6 +370,25 @@ def test_rolling_times_by_row():
     assert r.times[0, 0] == pytest.approx(T_K + v0 * t_row + TAU / 8)
 
 
+def test_rolling_roi_only_rows_of_target():
+    # марка идёт по v: за считывание кадра (0,1 с) — на 23 пикс.; ROI по
+    # времени всего кадра вытянулась бы на этот путь, а свет — только в
+    # строках, мимо которых марка шла во время их экспозиции
+    t_row = 5e-5
+    m = Motion.linear([0, 0, Z], [0.0, 0.05, 0.0], FACING)
+    full, _ = compute_roi(CAM, POSE, TARGET, m, T_K, TAU + CAM.height * t_row)
+    roi, clipped = compute_roi(CAM, POSE, TARGET, m, T_K, TAU, t_row=t_row)
+    assert not clipped and roi[3] < full[3] - 15
+    kw = {"ss": 4, "nt": 8, "shutter": "rolling", "t_row": t_row}
+    a = render(CAM, POSE, TARGET, m, T_K, TAU, **kw)
+    b = render(CAM, POSE, TARGET, m, T_K, TAU, roi=full, **kw)
+    assert a.roi == roi
+    assert b.irradiance.sum() == pytest.approx(a.irradiance.sum(), rel=1e-12)
+    du, dv = roi[0] - full[0], roi[1] - full[1]
+    inner = b.irradiance[dv : dv + roi[3], du : du + roi[2]]
+    np.testing.assert_allclose(inner, a.irradiance, rtol=1e-12, atol=1e-15)
+
+
 # ============================================================= 11. вне кадра
 
 
@@ -397,6 +416,78 @@ def test_result_readonly_and_meta():
         res.irradiance[0, 0] = 1.0
     with pytest.raises(ValueError):
         res.times[0] = 1.0
+
+
+# ============================================================= PSF до пикселя
+
+
+def test_psf_preserves_sum_and_background():
+    tg = Target(RADIUS, value_inside=0.9, value_outside=0.3)
+    m = Motion.static(world_for_pixel(3.3, -1.7), FACING)
+    plain = render(CAM, POSE, tg, m, T_K, TAU, ss=8, nt=1, margin_px=4)
+    blurred = render(
+        CAM, POSE, tg, m, T_K, TAU, ss=8, nt=1, margin_px=4, psf_sigma_px=0.7
+    )
+    assert blurred.roi == plain.roi and blurred.psf_sigma_px == 0.7
+    assert blurred.irradiance.sum() == pytest.approx(plain.irradiance.sum(), rel=1e-6)
+    # по краю ROI — фон; хвост гауссианы от марки на 5 sigma — 3e-8
+    np.testing.assert_allclose(edges(blurred.irradiance), 0.3, rtol=0, atol=1e-6)
+    assert np.abs(blurred.irradiance - plain.irradiance).max() > 0.05  # край размыт
+    zero = render(CAM, POSE, tg, m, T_K, TAU, ss=8, nt=1, margin_px=4, psf_sigma_px=0.0)
+    np.testing.assert_array_equal(zero.irradiance, plain.irradiance)
+
+
+def test_psf_matches_subpixel_gaussian_filter():
+    # PSF до пикселя = gaussian_filter субпиксельного кадра, затем среднее по
+    # пикселю; рендер интегрирует гауссиану по пикселю точно
+    from scipy.ndimage import gaussian_filter
+
+    ss, sigma = 16, 0.7
+    m = Motion.static(world_for_pixel(0.3, 0.6), FACING)
+    tg = Target(5 / F)  # R = 5 пикс.
+    blurred = render(CAM, POSE, tg, m, T_K, TAU, ss=ss, nt=1, margin_px=4,
+                     psf_sigma_px=sigma)
+    # субпиксельный кадр: марка || сенсору, образ — круг R = 5 пикс.
+    u0, v0, w, h = blurred.roi
+    off = (np.arange(ss) + 0.5) / ss - 0.5
+    U = u0 + np.arange(w)[:, None] + off[None, :]
+    V = v0 + np.arange(h)[:, None] + off[None, :]
+    uu, vv = np.meshgrid(U.ravel(), V.ravel())
+    r = np.hypot(uu - (CAM.cx + 0.3), vv - (CAM.cy + 0.6))
+    img = (r < 5.0).astype(float)
+    ref = gaussian_filter(img, sigma * ss, mode="nearest", truncate=6)
+    ref = ref.reshape(h, ss, w, ss).mean(axis=(1, 3))
+    np.testing.assert_allclose(blurred.irradiance, ref, rtol=0, atol=2e-3)
+
+
+@pytest.mark.parametrize("sigma, limit", [(0.0, None), (0.7, 1e-3)])
+def test_psf_removes_pixel_phase_of_centroid(sigma, limit):
+    # R = 5 пикс., ss = 64: без PSF размах центра тяжести по фазе 3,9e-3 —
+    # пиксельная фаза резкого края; PSF до пикселя убирает её до 6e-4
+    tg = Target(5 / F)
+    errs = []
+    for phase in np.linspace(0.0, 1.0, 6):
+        m = Motion.static(world_for_pixel(0.5 + phase, 0.5), FACING)
+        res = render(CAM, POSE, tg, m, T_K, TAU, ss=64, nt=1, margin_px=4,
+                     psf_sigma_px=sigma)
+        errs.append(centroid(res)[0] - (CAM.cx + 0.5 + phase))
+    span = np.ptp(errs)
+    if limit is None:
+        assert span > 3e-3
+    else:
+        assert span < limit
+
+
+def test_explicit_roi():
+    m = Motion.static(world_for_pixel(2.2, 1.1), FACING)
+    auto = render(CAM, POSE, TARGET, m, T_K, TAU, ss=4, nt=1)
+    fixed = render(CAM, POSE, TARGET, m, T_K, TAU, ss=4, nt=1, roi=auto.roi)
+    np.testing.assert_array_equal(fixed.irradiance, auto.irradiance)
+    u0, v0, w, h = auto.roi
+    roi = (u0 - 3, v0, w + 3, h)
+    wider = render(CAM, POSE, TARGET, m, T_K, TAU, ss=4, nt=1, roi=roi)
+    np.testing.assert_array_equal(wider.irradiance[:, 3:], auto.irradiance)
+    assert not wider.clipped
 
 
 def test_bad_args():

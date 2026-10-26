@@ -611,6 +611,21 @@ def test_ray_grid_cache_is_bounded(cam):
     assert len(cam._ray_cache) == Camera.RAY_CACHE_SIZE
 
 
+def test_ray_grid_cache_bytes_bounded(cam, monkeypatch):
+    one = sum(a.nbytes for a in cam.ray_grid(ROI, 3))
+    monkeypatch.setattr(Camera, "RAY_CACHE_BYTES", int(2.5 * one))
+    cam._ray_cache.clear()
+    for ss in (3, 3, 3):  # одна и та же сетка не вытесняет сама себя
+        cam.ray_grid(ROI, ss)
+    assert len(cam._ray_cache) == 1
+    cam.ray_grid((0, 0, 4, 4), 3)
+    cam.ray_grid((1, 1, 4, 4), 3)
+    assert len(cam._ray_cache) <= 3
+    monkeypatch.setattr(Camera, "RAY_CACHE_BYTES", 0)
+    cam.ray_grid(ROI, 5)  # больше бюджета: остаётся только текущая
+    assert list(cam._ray_cache) == [(tuple(ROI), 5, np.dtype(np.float64).str)]
+
+
 def test_ray_grid_readonly(cam_d):
     rays, mask = cam_d.ray_grid(ROI, 2)
     with pytest.raises(ValueError):

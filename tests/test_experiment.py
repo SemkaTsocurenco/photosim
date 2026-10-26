@@ -24,7 +24,10 @@ from photosim.experiment import (
     ablation,
     additivity,
     build,
+    config_from_row,
+    config_row,
     load_run,
+    run_configs,
     run_point,
     save_run,
     sweep,
@@ -208,6 +211,68 @@ def test_additivity_arithmetic():
     assert add["bias_u_px.residual"] == pytest.approx(0.5)
 
 
+MOTION_GROUP = {"motion_group": ["exposure", "motion", "rotation", "rolling_shutter"]}
+SIM_LEVEL = 2e-3  # уровень симулятора при ss = 16, пикс. (docs/conventions.md)
+
+
+def test_ablation_group_static_is_zero():
+    # неподвижная марка без вращения, глобальный затвор: выключение группы
+    # движения разом кадр не меняет
+    names = ["psf", "exposure", "motion", "rotation"]
+    base = replace(FAST, methods=("centroid", "ellipse"), tilt_deg=30.0)
+    df = ablation(base, names, groups=MOTION_GROUP)
+    g = df[df["mode"] == "leave_group_out"]
+    assert set(g["effect"]) == {"motion_group"}
+    assert len(g) == len(base.methods)
+    for name in MOTION_GROUP["motion_group"]:  # rolling_shutter не из names — тоже
+        assert not g[f"effects.{name}"].any()
+    assert g["effects.psf"].all() and g["effects.perspective"].all()
+
+    on = df[df["mode"] == "all"].set_index("method")
+    off = g.set_index("method")
+    for col in ("err0_u_px", "err0_v_px"):
+        assert (on[col] - off[col]).abs().max() <= SIM_LEVEL
+    # вклад группы заменяет в сумме вклады её эффектов поодиночке
+    add = additivity(df, ["err0_u_px"])
+    assert np.isfinite(add.to_numpy()).all()
+
+
+def test_ablation_group_validation():
+    with pytest.raises(ValueError, match="занято"):
+        ablation(FAST, ["psf"], groups={"motion": ["exposure"]})
+    with pytest.raises(ValueError, match="пустая"):
+        ablation(FAST, ["psf"], groups={"g": []})
+    with pytest.raises(ValueError, match="blur"):
+        ablation(FAST, ["psf"], groups={"g": ["blur"]})
+
+
+def test_additivity_group_arithmetic():
+    # группа {b, c}: поодиночке b и c ничего не дают, вместе — 2
+    rows = [
+        ("none", None, set(), 1.0),
+        ("single", "a", {"a"}, 2.0),
+        ("single", "b", {"b"}, 1.0),
+        ("single", "c", {"c"}, 1.0),
+        ("all", None, {"a", "b", "c"}, 5.0),
+        ("leave_group_out", "g", {"a"}, 3.0),
+    ]
+    flags = {"a": "psf", "b": "motion", "c": "exposure"}
+    df = pd.DataFrame(
+        [
+            {
+                "mode": m, "effect": e, "method": "c", "status": "ok", "bias_u_px": x,
+                **{f"effects.{name}": False for name in EFFECTS},
+                **{f"effects.{flags[k]}": True for k in on},
+            }
+            for m, e, on, x in rows
+        ]
+    )
+    add = additivity(df, ["bias_u_px"]).loc["c"]
+    assert add["bias_u_px.sum_single"] == pytest.approx(1.0 + 2.0)  # a + группа
+    assert add["bias_u_px.all"] == pytest.approx(4.0)
+    assert add["bias_u_px.residual"] == pytest.approx(-1.0)
+
+
 # ============================================================= 8. empty и clipped
 
 
@@ -253,9 +318,24 @@ def test_save_load_roundtrip(tmp_path):
     assert {"numpy", "scipy", "pandas"} <= set(loaded.meta["versions"])
     assert "git_commit" in loaded.meta
 
+    assert loaded.tables == {}
+
     again = save_run(df, base, "test", root=tmp_path)  # та же секунда
     assert again != path
     assert load_run(again).configs == {"base": base}
+
+
+def test_save_load_extra_tables(tmp_path):
+    main = pd.DataFrame({"case": ["axis", "field"], "eps_u": [0.1, np.nan]})
+    extra = pd.DataFrame({"method": ["centroid"], "flag": [True]})
+    configs = {"grid": {"theta": [15.0, 45.0]}}
+    path = save_run(main, configs, "t", tmp_path, {"b": extra})
+    loaded = load_run(path)
+    pd.testing.assert_frame_equal(loaded.df, main, check_exact=True)
+    pd.testing.assert_frame_equal(loaded.tables["b"], extra, check_exact=True)
+    assert loaded.meta["tables"] == ["b"] and loaded.meta["seed"] is None
+    with pytest.raises(ValueError, match="results"):
+        save_run(main, {}, "t", tmp_path, {"results": extra})
 
 
 # ============================================================= build
@@ -386,6 +466,110 @@ def test_rolling_shutter_reference_shift():
     assert abs(row["bias_u_px"]) < 2e-3 and abs(row["bias_v_px"]) < 2e-3
 
 
+def test_rolling_shutter_reference_fixed_point_along_v():
+    # по v строка центра зависит от сдвига: шаг итерации сжимает ошибку в
+    # |dv/dt| t_row ≈ 0,046 раза; двух шагов было мало (ошибка 1e-3 отн.)
+    t_row = 2e-5
+    cfg = replace(
+        FAST,
+        position=OFF_AXIS,
+        motion={"type": "linear", "velocity": (0.0, 0.5, 0.0)},
+        shutter="rolling",
+        t_row=t_row,
+        effects=only("exposure", "motion", "rolling_shutter"),
+        reference="proj_mid",
+    )
+    row = run(cfg).iloc[0]
+    assert row["ref_time_shift"] == pytest.approx(
+        row["ref.proj_mid.v"] * t_row, rel=1e-12
+    )
+    # proj_frame_mid — середина экспозиции строки 0, без сдвига
+    s = build(cfg)
+    frame = s.camera.project(s.pose.to_camera(s.motion.position(s.tau / 2)))
+    np.testing.assert_allclose(ref(row, "proj_frame_mid"), frame, atol=1e-9)
+    v_px = s.camera.fy * 0.5 / OFF_AXIS[2]
+    assert row["ref.proj_mid.v"] - row["ref.proj_frame_mid.v"] == pytest.approx(
+        v_px * row["ref_time_shift"], rel=1e-9
+    )
+    # растянутый по v образ: центр тяжести — в неподвижной точке
+    assert abs(row["bias_u_px"]) < 2e-3 and abs(row["bias_v_px"]) < 2e-3
+
+
+def test_proj_frame_mid_global_equals_proj_mid():
+    cfg = replace(
+        FAST,
+        motion={"type": "linear", "velocity": (0.3, 0.1, 0.0)},
+        effects=only("exposure", "motion"),
+    )
+    row = run(cfg).iloc[0]
+    np.testing.assert_array_equal(ref(row, "proj_frame_mid"), ref(row, "proj_mid"))
+
+
+def test_corr_uv_column():
+    noisy = run(replace(FAST, effects=only("shot_noise", "read_noise"))).iloc[0]
+    assert -1.0 <= noisy["corr_uv"] <= 1.0
+    clean = run(replace(FAST, effects=NONE)).iloc[0]
+    assert math.isnan(clean["corr_uv"])
+
+
+def test_run_configs_matches_sweep():
+    base = replace(FAST, effects=only("shot_noise"))
+    radii = [0.004, 0.006]
+    a = sweep(base, {"radius": radii})
+    b = run_configs(
+        [replace(base, radius=r) for r in radii], labels=[{"k": 0}, {"k": 1}]
+    )
+    pd.testing.assert_frame_equal(a, b.drop(columns="k"))
+    assert list(b["k"]) == [0, 1]
+    with pytest.raises(ValueError, match="пустой"):
+        run_configs([])
+
+
+# ============================================================= PSF и Крамер — Рао
+
+
+def test_psf_applied_once_in_render():
+    from photosim.estimators import estimate
+    from photosim.render import render
+
+    cfg = replace(
+        FAST, position=(0.0123, -0.0071, 1.0), methods=("gauss2d",),
+        effects=only("psf"),
+    )
+    s = build(cfg)
+    assert s.psf_sigma_px == s.sensor.psf_sigma_px == 0.7
+    assert build(replace(cfg, effects=NONE)).psf_sigma_px == 0.0
+    row = run(cfg).iloc[0]
+    # вручную: PSF в рендере (до пикселя), сенсор без своей PSF
+    res = render(
+        s.camera, s.pose, s.target, s.motion, 0.0, s.tau, ss=s.ss, nt=s.nt,
+        margin_px=s.sensor.required_margin_px, psf_sigma_px=0.7,
+    )
+    sensor = replace(s.sensor, psf=False)
+    img = sensor.expose(res.irradiance, s.tau, np.random.default_rng())
+    e = estimate("gauss2d", img, res.roi)
+    assert row["info0.sigma_x"] == pytest.approx(float(e.info["sigma_x"]), rel=1e-12)
+    assert {"info0.status", "info0.nfev", "info0.residual"} <= set(row.index)
+
+
+def test_crlb():
+    from photosim.analysis import centroid_sigma
+
+    base = replace(
+        FAST, position=(0.0123, -0.0071, 1.0), effects=only("shot_noise"), crlb=True
+    )
+    weak = run(replace(base, fill=0.1)).iloc[0]
+    strong = run(replace(base, fill=0.4)).iloc[0]
+    # только фотонный шум: информация пропорциональна сигналу, граница ∝ 1/sqrt(N)
+    assert weak["crlb_u_px"] == pytest.approx(2 * strong["crlb_u_px"], rel=1e-9)
+    assert strong["crlb_v_px"] == pytest.approx(strong["crlb_u_px"], rel=0.05)
+    # у равномерного диска положение несёт край: граница ниже центра тяжести
+    assert strong["crlb_u_px"] < centroid_sigma(strong["radius_px"], strong["signal_e"])
+    quiet = run(replace(base, effects=NONE)).iloc[0]  # шумов нет — границы нет
+    assert np.isnan(quiet["crlb_u_px"])
+    assert "crlb_u_px" not in run(replace(base, crlb=False)).columns
+
+
 # ============================================================= Config
 
 
@@ -403,6 +587,26 @@ def test_config_normalized_and_json_roundtrip():
     assert cfg.effects == replace(Effects(), psf=False)
     assert _from_json(json.loads(json.dumps(_to_json(cfg)))) == cfg
     np.testing.assert_allclose(build(cfg).pose.T, [0.0, 0.1, 0.0])
+
+
+def test_config_from_row(tmp_path):
+    cfg = replace(
+        FAST,
+        camera_pose=Pose.from_euler([0.0, 5.0, 0.0], [0.0, 0.0, 0.0]),
+        position=OFF_AXIS,
+        motion={"type": "arc", "center": (0.2, 0.3, 1.0), "axis": (0, 0, 1), "omega": 3.0},
+        rotation={"axis": (1, 1, 0), "omega": 2.0},
+        sensor_overrides={"read_noise_e": 3.0},
+        tau_ref=2e-3,
+        effects=only("psf", "motion"),
+        methods=("centroid", "ellipse"),
+        crlb=True,
+    )
+    assert config_from_row(config_row(cfg)) == cfg
+    # строка из сохранённого запуска: метки перебора и метрики не мешают
+    df = run_configs([FAST], labels=[{"L_px": 4.0}])
+    row = load_run(save_run(df, FAST, "t", tmp_path)).df.iloc[0]
+    assert config_from_row(row) == replace(FAST, tau_ref=FAST.tau)
 
 
 @pytest.mark.parametrize(

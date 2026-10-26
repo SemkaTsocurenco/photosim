@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
@@ -27,8 +28,10 @@ __all__ = [
     "FONT_SIZE",
     "METHOD_STYLE",
     "RC",
+    "SMALL_FONT_SIZE",
     "apply",
     "method_style",
+    "ordered",
     "save",
 ]
 
@@ -38,6 +41,9 @@ COLUMN = 3.5
 DOUBLE = 7.16
 #: Размер всех надписей, pt.
 FONT_SIZE = 8
+#: Подписи делений и легенда рисунка в одну колонку с панелями друг под
+#: другом, pt: шаблон допускает 7–8 pt, а узкая панель 8 pt не вмещает.
+SMALL_FONT_SIZE = 7
 
 #: Параметры matplotlib, которые ставит ``apply``.
 RC: dict[str, Any] = {
@@ -144,6 +150,14 @@ EFFECT_LABEL: dict[str, str] = {
 def apply() -> None:
     """Установить стиль статьи в ``matplotlib.rcParams``."""
     mpl.rcParams.update(RC)
+
+
+def ordered(methods: Iterable[str]) -> list[str]:
+    """Методы в порядке ``METHOD_STYLE`` (легенды и таблицы везде одинаковы);
+    неизвестные — в конце, по алфавиту."""
+    names = set(methods)
+    known = [m for m in METHOD_STYLE if m in names]
+    return known + sorted(names - set(known))
 
 
 def method_style(name: str) -> dict[str, Any]:

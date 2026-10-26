@@ -25,6 +25,7 @@ class Camera:
     _ray_cache: OrderedDict = field(init=False, repr=False, default_factory=OrderedDict)
 
     RAY_CACHE_SIZE = 8      # сколько разных (roi, ss) держать в памяти
+    RAY_CACHE_BYTES = 256 * 2**20   # и не больше байт: сетка при ss = 64 — сотни МБ
 
     def __post_init__(self):
         set_ = object.__setattr__      # обход frozen, только здесь
@@ -266,8 +267,13 @@ class Camera:
         valid.flags.writeable = False
 
         result = cache[key] = (rays, valid)
-        if len(cache) > self.RAY_CACHE_SIZE:
-            cache.popitem(last=False)          # выкинуть самый давний
+        # выкинуть самые давние; текущая сетка остаётся, даже если она больше бюджета
+        while len(cache) > 1 and (
+            len(cache) > self.RAY_CACHE_SIZE
+            or sum(r.nbytes + m.nbytes for r, m in cache.values())
+            > self.RAY_CACHE_BYTES
+        ):
+            cache.popitem(last=False)
         return result
 
 

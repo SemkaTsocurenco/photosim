@@ -12,11 +12,14 @@ from photosim.sensor import SensorModel
 
 __all__ = [
     "CAMERAS",
+    "FPS_MAX",
     "REVIEW_16MM",
     "RPI_CM3",
+    "RPI_CM3_ASSUMED",
     "SENSORS",
     "camera",
     "review_16mm",
+    "row_time_estimate",
     "rpi_cm3",
     "sensor",
 ]
@@ -28,7 +31,25 @@ CAMERAS: dict[str, dict[str, Any]] = {
     # Camera Module 3, стандартный объектив 4,74 мм (у Wide — 2,75 мм);
     # IMX708, 4608×2592, пиксель 1,4 мкм — паспорт Raspberry Pi
     "rpi_cm3": {"focal_mm": 4.74, "pixel_um": 1.4, "width": 4608, "height": 2592},
+    # тот же сенсор в режиме 2304×1296 с бинированием 2×2: пиксель 2,8 мкм,
+    # f ≈ 1693 пикс.
+    "rpi_cm3_2x2": {"focal_mm": 4.74, "pixel_um": 2.8, "width": 2304, "height": 1296},
 }
+
+#: Наибольшая частота кадров режимов Camera Module 3, кадр/с (паспорт
+#: Raspberry Pi; точнее — ``picamera2.Picamera2().sensor_modes``).
+FPS_MAX: dict[str, float] = {"rpi_cm3_2x2": 56.0}
+
+
+def row_time_estimate(name: str) -> float:
+    """Время считывания строки по паспортной частоте кадров, с.
+
+    ``t_row = 1 / (fps_max * rows)``: строки кадра считываются подряд за
+    период кадра. Не измерено. Это оценка сверху: в период кадра входит и
+    гашение по вертикали, поэтому настоящее ``t_row`` меньше. Для режима
+    2304×1296 при 56 кадр/с — 13,8 мкс.
+    """
+    return 1.0 / (_lookup(FPS_MAX, name, "режима") * CAMERAS[name]["height"])
 
 
 def camera(name: str) -> Camera:
@@ -60,6 +81,13 @@ RPI_CM3: dict[str, Any] = {
     # Оценка, не измерено.
     "psf_sigma_px": 0.7,
 }
+
+#: Шумы IMX708 — допущение, не измерено: отчёта EMVA 1288 нет. Значения
+#: типичны для пикселя BSI 1,4 мкм. Передаются в пресет как
+#: ``sensor_overrides``. В режиме с бинированием берутся те же значения:
+#: выигрыш от сложения пикселей не учитывается, случайная погрешность
+#: получается оценкой сверху.
+RPI_CM3_ASSUMED: dict[str, float] = {"full_well_e": 6000.0, "read_noise_e": 2.5}
 
 
 def review_16mm(tau_ref: float, fill: float = 0.7, **overrides: Any) -> SensorModel:

@@ -5,3 +5,6 @@ output/*
 runs
 .ruff_cache
 .pytest_cache
+/figures/
+/paper/
+!photosim/figures

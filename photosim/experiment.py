@@ -27,7 +27,7 @@ from photosim import presets
 from photosim.camera import Camera, Pose
 from photosim.estimators import ESTIMATORS, CenterEstimate, estimate
 from photosim.oracle import conic_center, exposure_conic_center
-from photosim.render import render
+from photosim.render import RenderResult, render
 from photosim.scene import (
     Accel,
     Arc,
@@ -55,8 +55,12 @@ __all__ = [
     "ablation",
     "additivity",
     "build",
+    "config_from_row",
+    "config_row",
+    "crlb",
     "load_run",
     "references",
+    "run_configs",
     "run_point",
     "save_run",
     "sweep",
@@ -66,7 +70,18 @@ __all__ = [
 T_K = 0.0
 
 #: Эталоны центра, см. ``references``.
-REFERENCES = ("proj_start", "proj_mid", "conic_mid", "exposure_conic")
+REFERENCES = (
+    "proj_start",
+    "proj_mid",
+    "conic_mid",
+    "exposure_conic",
+    "proj_frame_mid",
+)
+
+#: Сдвиг времени строки центра (``references``): допуск неподвижной точки, с,
+#: и предел числа шагов.
+_SHIFT_TOL_S = 1e-15
+_SHIFT_MAX_ITER = 100
 
 #: От чего отсчитывается наклон марки, см. ``Config``.
 TILT_REFERENCES = ("optical_axis", "line_of_sight")
@@ -194,6 +209,8 @@ class Config:
         Включённые эффекты.
     reference
         Эталон для метрик, один из ``REFERENCES``.
+    crlb
+        Считать границу Крамера — Рао (``crlb``): ещё 4 рендера на точку.
     """
 
     camera: str = "review_16mm"
@@ -220,6 +237,7 @@ class Config:
     methods: tuple[str, ...] = field(default_factory=lambda: tuple(ESTIMATORS))
     effects: Effects = field(default_factory=Effects)
     reference: str = "exposure_conic"
+    crlb: bool = False
 
     def __post_init__(self) -> None:
         set_ = object.__setattr__  # обход frozen, только здесь
@@ -267,6 +285,7 @@ class Setup:
     nt: int
     shutter: str
     t_row: float
+    psf_sigma_px: float  # PSF рендера (до пикселя); 0 — эффект psf выключен
 
 
 def _rotate(axis: NDArray, angle: float) -> NDArray:
@@ -377,6 +396,7 @@ def build(config: Config) -> Setup:
         nt=cfg.nt if eff.exposure else 1,
         shutter="rolling" if rolling else "global",
         t_row=cfg.t_row if rolling else 0.0,
+        psf_sigma_px=sensor.psf_sigma_px if eff.psf else 0.0,
     )
 
 
@@ -385,6 +405,11 @@ def build(config: Config) -> Setup:
 
 def references(setup: Setup) -> tuple[dict[str, NDArray], float]:
     """Эталоны центра и сдвиг времени строки, с.
+
+    При построчном затворе первые четыре эталона сдвинуты на время строки
+    центра ``v * t_row``; ``proj_frame_mid`` — проекция в середине
+    экспозиции кадра (строки 0) без сдвига: так привязывает кадр обычная
+    обработка. При глобальном затворе ``proj_frame_mid = proj_mid``.
     """
     s = setup
     radius = s.target.radius
@@ -394,8 +419,20 @@ def references(setup: Setup) -> tuple[dict[str, NDArray], float]:
 
     shift = 0.0
     if s.shutter == "rolling":
-        for _ in range(2):  # строка зависит от сдвига; t_row мал, хватает двух
-            shift = float(project(T_K + shift + s.tau / 2)[1]) * s.t_row
+        # неподвижная точка shift = v(shift) * t_row: строка центра зависит от
+        # сдвига; шаг сжимает ошибку в |dv/dt| * t_row раз (~0,02 при 1 м/с
+        # по v у Camera Module 3), двух шагов не хватает
+        for _ in range(_SHIFT_MAX_ITER):
+            new = float(project(T_K + shift + s.tau / 2)[1]) * s.t_row
+            done = abs(new - shift) <= _SHIFT_TOL_S
+            shift = new
+            if done:
+                break
+        else:
+            raise ValueError(
+                "время строки центра не сходится: марка движется по v "
+                "не медленнее построчного затвора"
+            )
     t0 = T_K + shift
     mid = t0 + s.tau / 2
     refs = {
@@ -407,6 +444,7 @@ def references(setup: Setup) -> tuple[dict[str, NDArray], float]:
         "exposure_conic": exposure_conic_center(
             s.camera, s.pose, s.motion, radius, t0, s.tau, s.nt
         ),
+        "proj_frame_mid": project(T_K + s.tau / 2),
     }
     return refs, shift
 
@@ -436,6 +474,15 @@ def _metrics(est: CenterEstimate, est0: CenterEstimate, ref: NDArray) -> dict:
     }
 
 
+def _corr(uv: NDArray) -> float:
+    """Коэффициент корреляции u и v; ``nan`` при < 3 оценках или без разброса."""
+    if len(uv) < 3:
+        return math.nan
+    d = uv - uv.mean(axis=0)
+    norm = math.sqrt(float(np.sum(d[:, 0] ** 2) * np.sum(d[:, 1] ** 2)))
+    return float(np.sum(d[:, 0] * d[:, 1]) / norm) if norm > 0 else math.nan
+
+
 def config_row(config: Config) -> dict[str, Any]:
     """Параметры конфигурации плоским словарём для строки таблицы.
     """
@@ -455,6 +502,27 @@ def config_row(config: Config) -> dict[str, Any]:
     return row
 
 
+def config_from_row(row: Mapping[str, Any]) -> Config:
+    """Конфигурация точки по строке таблицы результатов (обратно ``config_row``).
+
+    Лишние колонки (метрики, метки перебора) не нужны и не мешают.
+    ``tau_ref`` возвращается числом: в строке ``None`` уже заменено на
+    ``tau``, точка та же.
+    """
+    kw: dict[str, Any] = {}
+    for f in fields(Config):
+        if f.name == "effects":
+            kw[f.name] = Effects(**{k: bool(row[f"effects.{k}"]) for k in EFFECTS})
+        elif f.name == "position":
+            kw[f.name] = tuple(float(row[f"position.{c}"]) for c in "xyz")
+        elif f.name in _JSON_FIELDS:
+            kw[f.name] = json.loads(row[f.name])
+        else:
+            value = row[f.name]
+            kw[f.name] = value.item() if isinstance(value, np.generic) else value
+    return Config(**kw)
+
+
 def run_point(
     config: Config, seed: np.random.SeedSequence | None = None
 ) -> list[dict[str, Any]]:
@@ -463,19 +531,7 @@ def run_point(
     s = build(config)
     rng = np.random.default_rng(seed if seed is not None else config.seed)
     base = config_row(config)
-    res = render(
-        s.camera,
-        s.pose,
-        s.target,
-        s.motion,
-        T_K,
-        s.tau,
-        ss=s.ss,
-        nt=s.nt,
-        shutter=s.shutter,
-        t_row=s.t_row,
-        margin_px=s.sensor.required_margin_px,
-    )
+    res = _render(s, s.motion)
     status = "empty" if res.empty else "clipped" if res.clipped else "ok"
     if status != "ok":
         return [{**base, "method": m, "status": status} for m in config.methods]
@@ -484,9 +540,11 @@ def run_point(
     ref = refs[config.reference]
     z = float(s.pose.to_camera(s.motion.position(s.t_ref))[2])
     um_per_px = z / s.camera.fx * 1e6
-    clean = replace(s.sensor, shot_noise=False, read_noise=False, quantization=False)
+    # PSF уже применил рендер (до пикселя); этап psf сенсора — дважды не размывать
+    sensor = replace(s.sensor, psf=False)
+    clean = replace(sensor, shot_noise=False, read_noise=False, quantization=False)
     image0 = clean.expose(res.irradiance, s.tau, rng)  # шум не генерируется
-    frames = s.sensor.expose_many(res.irradiance, s.tau, rng, config.n_mc)
+    frames = sensor.expose_many(res.irradiance, s.tau, rng, config.n_mc)
     point = {
         **base,
         "status": status,
@@ -500,9 +558,24 @@ def run_point(
         "roi.w": res.roi[2],
         "roi.h": res.roi[3],
         "ref_time_shift": shift,
+        # параметры сенсора — для теории при построении рисунков
+        **{
+            f"sensor.{k}": float(getattr(s.sensor, k))
+            for k in (
+                "flux_e_per_s",
+                "dark_e_per_s",
+                "read_noise_e",
+                "full_well_e",
+                "gain_e_per_dn",
+                "black_level_dn",
+                "psf_sigma_px",
+            )
+        },
     }
     for name, uv in refs.items():
         point[f"ref.{name}.u"], point[f"ref.{name}.v"] = (float(x) for x in uv)
+    if config.crlb:
+        point.update(crlb(s, res, sensor))
 
     black = s.sensor.black_level_dn
     rows = []
@@ -513,10 +586,104 @@ def run_point(
         for key, value in _metrics(est, est0, ref).items():
             row[f"{key}_px"] = float(value)
             row[f"{key}_um"] = float(value) * um_per_px
+        # коэффициент корреляции u и v: СКО вдоль любого направления
+        row["corr_uv"] = _corr(est.uv[est.ok])
         row["ok_frac"] = float(est.ok.mean())
         row["ok0_frac"] = float(est0.ok)
+        # диагностика метода без шума (например, сходимость gauss2d)
+        for key, value in est0.info.items():
+            if np.ndim(value) == 0:
+                row[f"info0.{key}"] = float(value)
         rows.append(row)
     return rows
+
+
+def _render(s: Setup, motion: Motion, roi: tuple | None = None) -> RenderResult:
+    return render(
+        s.camera,
+        s.pose,
+        s.target,
+        motion,
+        T_K,
+        s.tau,
+        ss=s.ss,
+        nt=s.nt,
+        shutter=s.shutter,
+        t_row=s.t_row,
+        margin_px=s.sensor.required_margin_px,
+        psf_sigma_px=s.psf_sigma_px,
+        roi=roi,
+    )
+
+
+@dataclass(frozen=True, eq=False)
+class _Shifted:
+    """Закон движения центра, сдвинутый на постоянный вектор ``d``."""
+
+    law: Any
+    d: NDArray
+
+    def position(self, t: Any) -> NDArray:
+        return self.law.position(t) + self.d
+
+    def velocity(self, t: Any) -> NDArray:
+        return self.law.velocity(t)
+
+    def acceleration(self, t: Any) -> NDArray:
+        return self.law.acceleration(t)
+
+
+#: Сдвиг марки для производной кадра в ``crlb``, пикс. изображения.
+CRLB_SHIFT_PX = 0.25
+
+
+def crlb(s: Setup, res: RenderResult, sensor: SensorModel) -> dict[str, float]:
+    """Граница Крамера — Рао для центра (u, v), пикс.: ``crlb_u_px``, ``crlb_v_px``.
+
+    Информация Фишера по кадру без шума: ``F = sum(grad mu_i grad mu_i^T / var_i)``,
+    ``mu`` — электроны в пикселе, ``var`` — дисперсия от включённых шумов
+    (фотоны, считывание, квантование). Производные — центральные разности
+    при сдвиге марки вдоль осей x и y камеры на ``±CRLB_SHIFT_PX`` пикс. на
+    том же ROI, пересчитанные в (u, v) по сдвигу проекции центра. Яркость и
+    фон считаются известными, поэтому граница — нижняя для любого
+    несмещённого метода.
+    """
+    clean = replace(sensor, shot_noise=False, read_noise=False, quantization=False)
+    mu = clean.mean_electrons(res.irradiance, s.tau)
+    var = np.zeros_like(mu)
+    if sensor.shot_noise:
+        var += mu
+    if sensor.read_noise:
+        var += sensor.read_noise_e**2
+    if sensor.quantization:
+        var += sensor.gain_e_per_dn**2 / 12
+    nan = {"crlb_u_px": math.nan, "crlb_v_px": math.nan}
+    keep = var > 0
+    if not keep.any():
+        return nan
+
+    X = s.motion.position(s.t_ref)
+    z = float(s.pose.to_camera(X)[2])
+    grads, shifts = [], []
+    for axis in (0, 1):
+        d = s.pose.R[axis] * CRLB_SHIFT_PX * z / s.camera.fx  # ось камеры в мире
+        imgs, uvs = [], []
+        for sign in (1.0, -1.0):
+            law = _Shifted(s.motion.translation_law, sign * d)
+            moved = Motion(law, s.motion.orientation_law)
+            r = _render(s, moved, roi=res.roi)
+            imgs.append(clean.mean_electrons(r.irradiance, s.tau))
+            uvs.append(s.camera.project(s.pose.to_camera(X + sign * d)))
+        grads.append((imgs[0] - imgs[1])[keep])
+        shifts.append(uvs[0] - uvs[1])
+    G = np.stack(grads, axis=1)  # производные по сдвигам (на 2 d)
+    J = np.stack(shifts, axis=1)  # d(u, v) / d(сдвиги), (2, 2)
+    fisher = G.T @ (G / var[keep][:, None])
+    try:
+        cov = J @ np.linalg.inv(fisher) @ J.T
+    except np.linalg.LinAlgError:
+        return nan
+    return {"crlb_u_px": math.sqrt(cov[0, 0]), "crlb_v_px": math.sqrt(cov[1, 1])}
 
 
 # Перебор
@@ -570,6 +737,27 @@ def _run_all(
     return pd.DataFrame(rows)
 
 
+def run_configs(
+    configs: Sequence[Config],
+    *,
+    labels: Sequence[Mapping[str, Any]] | None = None,
+    seed: int | None = None,
+    n_jobs: int = 1,
+) -> pd.DataFrame:
+    """Точки из списка конфигураций (не произведение, как ``sweep``).
+
+    ``labels`` — дополнительные колонки каждой точки; ``seed`` — корень
+    ``SeedSequence`` (по умолчанию seed первой конфигурации). ``n_jobs`` —
+    как в ``sweep``.
+    """
+    configs = list(configs)
+    if not configs:
+        raise ValueError("configs: пустой список")
+    labels = [{}] * len(configs) if labels is None else list(labels)
+    root = configs[0].seed if seed is None else seed
+    return _run_all(configs, root, labels, n_jobs)
+
+
 def sweep(
     base: Config, grid: Mapping[str, Sequence[Any]], *, n_jobs: int = 1
 ) -> pd.DataFrame:
@@ -595,23 +783,48 @@ def sweep(
 
 
 def ablation(
-    base: Config, effects: Sequence[str] | None = None, *, n_jobs: int = 1
+    base: Config,
+    effects: Sequence[str] | None = None,
+    *,
+    groups: Mapping[str, Sequence[str]] | None = None,
+    n_jobs: int = 1,
 ) -> pd.DataFrame:
     """Режимы включения эффектов: колонки ``mode`` и ``effect``.
+
+    ``groups`` — эффекты, которые выключаются разом, например
+    ``{"motion_group": ["exposure", "motion", "rotation", "rolling_shutter"]}``:
+    режим ``leave_group_out`` (эффекты ``effects`` включены, группа
+    выключена), в колонке ``effect`` — имя группы. Вклад группы — ``all``
+    минус ``leave_group_out``: поодиночке её эффекты могут ничего не давать
+    (смаз — совместный эффект движения и экспозиции). Эффект группы не из
+    ``effects`` в этом режиме тоже выключается.
 
     ``n_jobs`` — как в ``sweep``.
     """
     names = list(EFFECTS if effects is None else effects)
     for name in names:
         _choice(name, EFFECTS, "effect")
+    groups = {str(g): list(members) for g, members in (groups or {}).items()}
+    for group, members in groups.items():
+        if group in EFFECTS:
+            raise ValueError(f"группа {group!r}: имя занято эффектом")
+        if not members:
+            raise ValueError(f"группа {group!r}: пустая")
+        for name in members:
+            _choice(name, EFFECTS, f"эффект группы {group!r}")
 
-    def with_on(on: set[str]) -> Config:
+    def with_on(on: set[str], off: Sequence[str] = ()) -> Config:
         flags = {**asdict(base.effects), **{n: n in on for n in names}}
+        flags.update(dict.fromkeys(off, False))
         return replace(base, effects=Effects(**flags))
 
     plan = [("none", None, with_on(set())), ("all", None, with_on(set(names)))]
     plan += [("single", n, with_on({n})) for n in names]
     plan += [("leave_one_out", n, with_on(set(names) - {n})) for n in names]
+    plan += [
+        ("leave_group_out", g, with_on(set(names) - set(m), m))
+        for g, m in groups.items()
+    ]
     labels = [{"mode": mode, "effect": eff} for mode, eff, _ in plan]
     return _run_all([cfg for _, _, cfg in plan], base.seed, labels, n_jobs)
 
@@ -630,7 +843,14 @@ ADDITIVE_METRICS = (
 def additivity(
     df: pd.DataFrame, metrics: Sequence[str] = ADDITIVE_METRICS
 ) -> pd.DataFrame:
-    """Проверка аддитивности эффектов по таблице ``ablation``..
+    """Проверка аддитивности эффектов по таблице ``ablation``.
+
+    ``sum_single`` — сумма вкладов ``single - none``; ``all`` — ``all -
+    none``; ``residual`` — их разность (неаддитивность). Если в таблице есть
+    группы (режим ``leave_group_out``), вклад группы ``all -
+    leave_group_out`` заменяет в сумме вклады её эффектов поодиночке; состав
+    группы — эффекты, включённые в ``all`` и выключенные в её режиме
+    (колонки ``effects.*``).
     """
     d = df[df["status"] == "ok"].copy()
     for m in metrics:
@@ -642,9 +862,20 @@ def additivity(
         return d[d["mode"] == name].set_index("method")[cols]
 
     none = mode("none")
-    single = mode("single")
-    contrib = single - none.reindex(single.index).to_numpy()
-    sum_single = contrib.groupby(level=0).sum()
+    parts, grouped = [], set()
+    groups = d[d["mode"] == "leave_group_out"]
+    if not groups.empty:
+        on = d[d["mode"] == "all"].iloc[0]
+        for _, g in groups.groupby("effect", sort=False):
+            off = g.iloc[0]
+            grouped |= {
+                e for e in EFFECTS if on[f"effects.{e}"] and not off[f"effects.{e}"]
+            }
+            parts.append(mode("all") - g.set_index("method")[cols])
+    single = d[(d["mode"] == "single") & ~d["effect"].isin(grouped)]
+    single = single.set_index("method")[cols]
+    parts.append(single - none.reindex(single.index).to_numpy())
+    sum_single = pd.concat(parts).groupby(level=0).sum()
     total = mode("all") - none
     out = {}
     for m in cols:
@@ -663,6 +894,7 @@ class Run(NamedTuple):
     configs: dict[str, Any]
     meta: dict[str, Any]
     path: Path
+    tables: dict[str, pd.DataFrame]  # дополнительные таблицы: <имя>.parquet
 
 
 def _to_json(obj: Any) -> Any:
@@ -727,11 +959,18 @@ def save_run(
     configs: Config | Mapping[str, Any],
     name: str,
     root: str | Path = RUNS_DIR,
+    tables: Mapping[str, pd.DataFrame] | None = None,
 ) -> Path:
     """Сохранить запуск в ``root/<YYYYMMDD_HHMMSS>_<name>/`` и вернуть путь.
+
+    ``tables`` — дополнительные таблицы другой структуры, каждая в
+    ``<имя>.parquet`` рядом с ``results.parquet``.
     """
     if isinstance(configs, Config):
         configs = {"base": configs}
+    tables = dict(tables or {})
+    if "results" in tables:
+        raise ValueError("имя results занято основной таблицей")
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     path = Path(root) / f"{stamp}_{name}"
     k = 1
@@ -741,6 +980,8 @@ def save_run(
     path.mkdir(parents=True)
 
     df.to_parquet(path / "results.parquet")
+    for key, table in tables.items():
+        table.to_parquet(path / f"{key}.parquet")
     _write_json(path / "config.json", _to_json(configs))
     commit = _git("rev-parse", "HEAD")
     base = configs.get("base")
@@ -752,6 +993,7 @@ def save_run(
         "git_dirty": None if commit is None else bool(_git("status", "--porcelain")),
         "seed": base.seed if isinstance(base, Config) else None,
         "rows": len(df),
+        "tables": sorted(tables),
         "versions": _versions(),
     }
     _write_json(path / "meta.json", meta)
@@ -770,4 +1012,9 @@ def load_run(path: str | Path) -> Run:
         configs=_from_json(json.loads((path / "config.json").read_text())),
         meta=json.loads((path / "meta.json").read_text()),
         path=path,
+        tables={
+            p.stem: pd.read_parquet(p)
+            for p in sorted(path.glob("*.parquet"))
+            if p.name != "results.parquet"
+        },
     )

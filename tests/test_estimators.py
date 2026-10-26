@@ -6,6 +6,7 @@
 """
 
 import math
+from dataclasses import replace
 
 import numpy as np
 import pytest
@@ -37,16 +38,19 @@ METHODS = ["centroid", "centroid_thr50", "centroid_sq", "gauss2d", "ellipse"]
 CENTROIDS = ["centroid", "centroid_thr50", "centroid_sq"]
 
 
-def clean_sensor(psf):
-    """Сенсор без шумов: кадр = облучённость · 2800 ед. (+ PSF)."""
+PSF = 0.7  # СКО PSF, пикс.; её применяет рендер до усреднения по пикселю
+
+
+def clean_sensor():
+    """Сенсор без шумов и без своей PSF: кадр = облучённость · 2800 ед."""
     return SensorModel(
         flux_e_per_s=7e5,
         read_noise_e=2.5,
         full_well_e=10_000.0,
         gain_e_per_dn=2.5,
         bits=12,
-        psf_sigma_px=0.7,
-        psf=psf,
+        psf_sigma_px=PSF,
+        psf=False,
         shot_noise=False,
         read_noise=False,
         saturation=False,
@@ -54,7 +58,7 @@ def clean_sensor(psf):
     )
 
 
-MARGIN = clean_sensor(psf=True).required_margin_px
+MARGIN = math.ceil(4 * PSF) + 1  # SensorModel.required_margin_px при PSF
 
 
 def tilted_normal(deg):
@@ -62,35 +66,39 @@ def tilted_normal(deg):
     return [-math.sin(a), 0.0, -math.cos(a)]
 
 
-def scene(motion, ss=16):
-    """Рендер и эталонный центр эллипса."""
-    res = render(CAM, POSE, TARGET, motion, 0.0, TAU, ss=ss, nt=1, margin_px=MARGIN)
+def scene(motion, ss=16, psf=False):
+    """Рендер (с PSF до пикселя или без) и эталонный центр эллипса."""
+    res = render(
+        CAM, POSE, TARGET, motion, 0.0, TAU, ss=ss, nt=1, margin_px=MARGIN,
+        psf_sigma_px=PSF if psf else 0.0,
+    )
     ref = conic_center(CAM, POSE, motion.position(0.0), motion.orientation(0.0), RADIUS)
     return res, ref
 
 
-def expose(res, psf):
-    return clean_sensor(psf).expose(res.irradiance, TAU, np.random.default_rng(0))
+def expose(res):
+    return clean_sensor().expose(res.irradiance, TAU, np.random.default_rng(0))
 
 
 @pytest.fixture(scope="module")
 def facing_scenes():
-    """10 дробных положений марки, смотрящей в камеру."""
+    """10 дробных положений марки, смотрящей в камеру: без PSF и с PSF."""
     rng = np.random.default_rng(3)
-    out = []
+    motions = []
     for _ in range(10):
         du, dv = rng.uniform(-900, 900), rng.uniform(-700, 700)
-        out.append(scene(Motion.static([du / F, dv / F, 1.0], FACING)))
-    return out
+        motions.append(Motion.static([du / F, dv / F, 1.0], FACING))
+    return {psf: [scene(m, psf=psf) for m in motions] for psf in (False, True)}
 
 
 @pytest.fixture(scope="module")
 def noisy():
-    """Кадр с шумами пресета review_16mm (марка 70 % ёмкости)."""
+    """Кадр с шумами пресета review_16mm (марка 70 % ёмкости), PSF в рендере."""
     m = Motion.static([0.01, -0.02, 1.0], FACING)
-    res = render(CAM, POSE, TARGET, m, 0.0, TAU, ss=8, nt=1, margin_px=MARGIN)
+    res, _ = scene(m, ss=8, psf=True)
+    sensor = replace(review_16mm(TAU), psf=False)
     rng = np.random.default_rng(1)
-    return review_16mm(TAU).expose_many(res.irradiance, TAU, rng, 3), res.roi
+    return sensor.expose_many(res.irradiance, TAU, rng, 3), res.roi
 
 
 # ============================================================= 1–2. без шума, в камеру
@@ -100,27 +108,27 @@ def noisy():
 # линеен по яркости, и его ошибка — шум дискретизации рендера. Остальные
 # методы нелинейны и на резком диске дают собственное смещение порядка
 # 1e-2, зависящее от положения края относительно пикселей. Это свойство
-# метода, а не разрешение симулятора. Оно убывает с размытием (для эллипса
-# медиана 5,8e-3 / 3,7e-3 / 2,4e-3 / 1,3e-3 при sigma = 0 / 0,7 / 1 / 1,5).
-# Подгонка gauss2d сходится честно: при ftol = xtol = gtol = 1e-15 ошибка
-# та же; это несовпадение модели с диском в несимметричном вокруг него ROI.
+# метода, а не разрешение симулятора. PSF до пикселя (как в оптике) его
+# подавляет. gauss2d подгоняется в окне, симметричном вокруг начального
+# приближения; остаток ~4e-3 — несовпадение модели: к диску R = 23 пикс.
+# подходит широкий купол (sigma ≈ 28 пикс.), и PSF его почти не меняет.
 #
-# Замер на 10 положениях (медиана / максимум, пикс.):
+# Замер на 10 положениях (медиана / максимум, пикс.), PSF 0,7 в рендере:
 #
 #   метод            без PSF            PSF 0,7
-#   centroid         6,2e-4 / 9,6e-4    6,2e-4 / 9,6e-4
-#   centroid_thr50   7,1e-3 / 2,1e-2    3,8e-3 / 1,0e-2
-#   centroid_sq      5,7e-3 / 8,1e-3    2,6e-3 / 3,7e-3
-#   gauss2d          8,8e-3 / 1,5e-2    8,3e-3 / 1,4e-2
-#   ellipse          5,8e-3 / 1,3e-2    3,7e-3 / 6,6e-3
+#   centroid         6,2e-4 / 9,6e-4    6,2e-4 / 8,8e-4
+#   centroid_thr50   7,1e-3 / 2,1e-2    2,6e-3 / 7,7e-3
+#   centroid_sq      5,7e-3 / 8,1e-3    6,1e-4 / 8,7e-4
+#   gauss2d          3,9e-3 / 4,9e-3    3,9e-3 / 4,9e-3
+#   ellipse          5,8e-3 / 1,3e-2    2,1e-3 / 3,9e-3
 #
 # Пороги ниже — ТЗ для centroid, для остальных — замер с запасом ~1,5.
 BOUND = {  # (без PSF, PSF)
     "centroid": (3e-3, 3e-3),
-    "centroid_thr50": (3e-2, 1.5e-2),
-    "centroid_sq": (1.2e-2, 6e-3),
-    "gauss2d": (2.5e-2, 2e-2),
-    "ellipse": (2e-2, 1e-2),
+    "centroid_thr50": (3e-2, 1.2e-2),
+    "centroid_sq": (1.2e-2, 1.5e-3),
+    "gauss2d": (8e-3, 8e-3),
+    "ellipse": (2e-2, 6e-3),
 }
 
 
@@ -128,11 +136,28 @@ BOUND = {  # (без PSF, PSF)
 @pytest.mark.parametrize("method", METHODS)
 def test_noiseless_facing(facing_scenes, method, psf):
     errs = []
-    for res, ref in facing_scenes:
-        e = estimate(method, expose(res, psf), res.roi)
+    for res, ref in facing_scenes[psf]:
+        e = estimate(method, expose(res), res.roi)
         assert e.ok
         errs.append(np.abs(e.uv - ref).max())
     assert max(errs) < BOUND[method][psf]
+
+
+def test_gauss2d_window_follows_center_not_roi():
+    # Окно подгонки симметрично вокруг начального приближения. R = 10 пикс.,
+    # фаза 0,3: с окном по всему ROI обрезка ROI на столбец сдвигала оценку
+    # на 2e-2 пикс., теперь — до 3,3e-3 (остаток: окно на пиксель уже). У
+    # большой марки (R = 23) купол гауссианы чувствителен и к размеру окна:
+    # 8e-3 против 1,2e-2 — это несовпадение модели, а не обрезка.
+    m = Motion.static([(0.3 + 0.5) / F, 0.5 / F, 1.0], FACING)
+    res = render(CAM, POSE, Target(10 / F), m, 0.0, TAU, ss=16, nt=1, margin_px=MARGIN)
+    img, (u0, v0, w, h) = expose(res), res.roi
+    full = estimate("gauss2d", img, res.roi).uv
+    for crop, roi in (
+        (img[:, 1:], (u0 + 1, v0, w - 1, h)),
+        (img[:, :-1], (u0, v0, w - 1, h)),
+    ):
+        assert np.abs(estimate("gauss2d", crop, roi).uv - full).max() < 5e-3
 
 
 # ============================================================= 3. наклон 45°, вне оси
@@ -141,8 +166,8 @@ def test_noiseless_facing(facing_scenes, method, psf):
 @pytest.mark.parametrize("psf", [False, True], ids=["no_psf", "psf"])
 def test_tilted_off_axis(psf):
     m = Motion.static([0.2, 0.1, 1.0], tilted_normal(45))
-    res, ref = scene(m)
-    img = expose(res, psf)
+    res, ref = scene(m, psf=psf)
+    img = expose(res)
     assert np.abs(estimate("centroid", img, res.roi).uv - ref).max() < 3e-3
 
     C_ref = _image_conic(CAM, POSE, m.position(0.0), m.orientation(0.0), RADIUS)
@@ -269,13 +294,14 @@ def test_batch_matches_loop(noisy, method):
 # ============================================================= 8. Монте-Карло на оси
 #
 # Заготовка E1. Пресет review_16mm, марка 70 % ёмкости (≈ 7760 e⁻ в пике),
-# PSF 0,7, все шумы, 500 реализаций, seed 2026. Замер (смещение / СКО по u, пикс.):
+# PSF 0,7 (в рендере), все шумы, 500 реализаций, seed 2026. Замер (смещение /
+# СКО по u, пикс.):
 #
-#   centroid         -9e-5 / 3,4e-3   (прогноз по шуму пикселей 3,2e-3)
-#   centroid_thr50   -2e-4 / 7,2e-3
-#   centroid_sq      -2e-4 / 6,7e-3
-#   gauss2d          -9e-5 / 3,7e-3
-#   ellipse           2e-5 / 1,8e-3
+#   centroid         -3e-5 / 3,3e-3   (прогноз по шуму пикселей 3,2e-3)
+#   centroid_thr50    7e-5 / 7,1e-3
+#   centroid_sq      -2e-5 / 6,5e-3
+#   gauss2d          -2e-5 / 3,6e-3
+#   ellipse          -4e-6 / 1,8e-3
 #
 # СКО центра тяжести ≈ R / (2 sqrt(N_e)), N_e — электронов в марке: при
 # такой яркости это 3e-3, а не 1e-2 и тем более не 0,05 пикс. из литературы.
@@ -283,9 +309,9 @@ def test_batch_matches_loop(noisy, method):
 
 def test_monte_carlo_centroid_on_axis():
     n = 500
-    sensor = review_16mm(TAU)
+    sensor = replace(review_16mm(TAU), psf=False)  # PSF — в рендере
     m = Motion.static([0.0, 0.0, 1.0], FACING)
-    res, ref = scene(m)
+    res, ref = scene(m, psf=True)
     frames = sensor.expose_many(res.irradiance, TAU, np.random.default_rng(2026), n)
     e = estimate("centroid", frames, res.roi)
     assert e.ok.all()
